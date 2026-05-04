@@ -1,0 +1,33 @@
+[package]
+name = "velo-core"
+version = "0.1.0"
+edition = "2024"
+description = "Native Rust speculative inference engine experiments for Apple Silicon."
+license = "MIT"
+
+[lib]
+name = "velo_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "velo-bench"
+path = "src/bin/velo-bench.rs"
+
+[[bin]]
+name = "velo-run"
+path = "src/bin/velo-run.rs"
+
+[[bin]]
+name = "velo-spec"
+path = "src/bin/velo-spec.rs"
+
+[[bench]]
+name = "smoke_bench"
+path = "benches/smoke_bench.rs"
+harness = false
+
+[dependencies]
+objc2-metal = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2 = "0.6.4"
+
