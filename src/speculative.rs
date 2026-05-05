@@ -21,6 +21,16 @@ pub trait DraftModel {
     }
 
     fn draft(&mut self, context: &[TokenId], max_tokens: usize) -> Result<Vec<NextTokenPrediction>>;
+
+    fn draft_batch(
+        &mut self,
+        requests: &[(&[TokenId], usize)],
+    ) -> Result<Vec<Vec<NextTokenPrediction>>> {
+        requests
+            .iter()
+            .map(|(ctx, max)| self.draft(ctx, *max))
+            .collect()
+    }
 }
 
 pub trait TargetModel {
@@ -33,11 +43,27 @@ pub trait TargetModel {
     }
 
     fn verify(&mut self, context: &[TokenId], drafted: &[TokenId]) -> Result<Vec<VerifyStep>>;
+
+    fn verify_batch(
+        &mut self,
+        requests: &[(&[TokenId], &[TokenId])],
+    ) -> Result<Vec<Vec<VerifyStep>>> {
+        requests
+            .iter()
+            .map(|(ctx, drafted)| self.verify(ctx, drafted))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeculativeDecoder {
     draft_window: usize,
+}
+
+impl SpeculativeDecoder {
+    pub fn draft_window(&self) -> usize {
+        self.draft_window
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +256,61 @@ impl SpeculativeSession {
 
         Ok(accepted)
     }
+
+    pub fn commit(
+        &mut self,
+        drafted: &[NextTokenPrediction],
+        verified: &[VerifyStep],
+    ) -> Result<Vec<TokenId>> {
+        if verified.len() != drafted.len() {
+            return Err(SpeculativeError::TargetReturnedWrongLength {
+                drafted: drafted.len(),
+                returned: verified.len(),
+            });
+        }
+
+        self.stats.drafted_tokens += drafted.len();
+
+        let mut accepted_this_round = 0;
+        let mut rejected = None;
+
+        for (index, (draft_pred, target_step)) in drafted.iter().zip(verified).enumerate() {
+            if draft_pred.token == target_step.expected {
+                accepted_this_round += 1;
+                continue;
+            }
+
+            rejected = Some((index, target_step.expected));
+            break;
+        }
+
+        let mut accepted = Vec::with_capacity(accepted_this_round);
+        if accepted_this_round > 0 {
+            let tokens: Vec<TokenId> =
+                drafted[..accepted_this_round].iter().map(|p| p.token).collect();
+            accepted.extend_from_slice(&tokens);
+            self.context.extend_from_slice(&tokens);
+            self.stats.accepted_tokens += accepted_this_round;
+        }
+
+        if let Some((rejected_index, target_token)) = rejected {
+            self.context.push(target_token);
+            self.rejected_token = Some(target_token);
+            self.stats.rejected_tokens += drafted.len() - rejected_index;
+        } else {
+            self.rejected_token = None;
+        }
+
+        Ok(accepted)
+    }
+
+    pub fn record_draft_call(&mut self) {
+        self.stats.draft_calls += 1;
+    }
+
+    pub fn record_target_call(&mut self) {
+        self.stats.target_calls += 1;
+    }
 }
 
 impl std::fmt::Display for SpeculativeError {
@@ -371,11 +452,101 @@ mod tests {
     }
 
     #[test]
+    fn speculative_error_display() {
+        assert!(format!("{}", SpeculativeError::EmptyDraftWindow).contains("draft window must be greater than zero"));
+        assert!(format!("{}", SpeculativeError::DraftReturnedTooMany { requested: 1, returned: 2 }).contains("draft model returned 2 tokens"));
+        assert!(format!("{}", SpeculativeError::TargetReturnedWrongLength { drafted: 1, returned: 2 }).contains("target model returned 2 verification steps"));
+        assert!(format!("{}", SpeculativeError::Model("oops".into())).contains("oops"));
+    }
+
+    #[test]
+    fn speculative_stats_ops() {
+        let s1 = SpeculativeStats { draft_calls: 1, ..Default::default() };
+        let s2 = SpeculativeStats { draft_calls: 2, ..Default::default() };
+        assert_eq!(s1.draft_calls + s2.draft_calls, 3);
+    }
+
+    #[test]
     fn session_exposes_prompt_and_context() {
         let decoder = SpeculativeDecoder::new(2).unwrap();
         let session = decoder.begin(&[7, 8]).unwrap();
 
         assert_eq!(session.prompt(), &[7, 8]);
         assert_eq!(session.context(), &[7, 8]);
+    }
+
+    #[test]
+    fn batch_default_impls() {
+        struct D; impl DraftModel for D { fn draft(&mut self, _: &[TokenId], m: usize) -> Result<Vec<NextTokenPrediction>> { Ok(vec![NextTokenPrediction{token:1, confidence:1.0}; m]) } }
+        struct T; impl TargetModel for T { fn verify(&mut self, _: &[TokenId], d: &[TokenId]) -> Result<Vec<VerifyStep>> { Ok(vec![VerifyStep{expected:1}; d.len()]) } }
+        
+        let mut d = D;
+        let mut t = T;
+        assert!(d.draft_batch(&[(&[1], 1)]).is_ok());
+        assert!(t.verify_batch(&[(&[1], &[1])]).is_ok());
+        assert!(d.bind_slot(crate::slot_manager::SlotId(0)).is_ok());
+        assert!(t.bind_slot(crate::slot_manager::SlotId(0)).is_ok());
+    }
+
+    #[test]
+    fn commit_logic() {
+        let decoder = SpeculativeDecoder::new(4).unwrap();
+        let mut session = decoder.begin(&[1]).unwrap();
+        let drafted = vec![NextTokenPrediction{token: 2, confidence: 1.0}];
+        let verified = vec![VerifyStep{expected: 2}];
+        let accepted = session.commit(&drafted, &verified).unwrap();
+        assert_eq!(accepted, vec![2]);
+        assert_eq!(session.context(), vec![1, 2]);
+        
+        // Error path
+        assert!(session.commit(&drafted, &[]).is_err());
+    }
+
+    #[test]
+    fn record_stats() {
+        let decoder = SpeculativeDecoder::new(4).unwrap();
+        let mut session = decoder.begin(&[]).unwrap();
+        session.record_draft_call();
+        session.record_target_call();
+        assert_eq!(session.stats().draft_calls, 1);
+        assert_eq!(session.stats().target_calls, 1);
+    }
+
+    #[test]
+    fn draft_error_paths() {
+        let decoder = SpeculativeDecoder::new(4).unwrap();
+        let mut session = decoder.begin(&[1]).unwrap();
+        
+        struct BadDraft;
+        impl DraftModel for BadDraft {
+            fn draft(&mut self, _: &[TokenId], _: usize) -> Result<Vec<NextTokenPrediction>> {
+                Ok(vec![NextTokenPrediction{token:1, confidence:1.0}; 10]) // Too many
+            }
+        }
+        struct EmptyDraft;
+        impl DraftModel for EmptyDraft {
+            fn draft(&mut self, _: &[TokenId], _: usize) -> Result<Vec<NextTokenPrediction>> {
+                Ok(vec![])
+            }
+        }
+        struct OkTarget;
+        impl TargetModel for OkTarget {
+            fn verify(&mut self, _: &[TokenId], d: &[TokenId]) -> Result<Vec<VerifyStep>> {
+                Ok(vec![VerifyStep{expected:1}; d.len()])
+            }
+        }
+        struct BadTarget;
+        impl TargetModel for BadTarget {
+            fn verify(&mut self, _: &[TokenId], _: &[TokenId]) -> Result<Vec<VerifyStep>> {
+                Ok(vec![]) // Wrong length
+            }
+        }
+
+        assert!(session.draft(&mut BadDraft, &mut OkTarget, 4).is_err());
+        assert!(session.draft(&mut EmptyDraft, &mut OkTarget, 4).unwrap().is_empty());
+        
+        let mut session = decoder.begin(&[1]).unwrap();
+        let mut good_draft = ScriptedDraft { script: vec![1, 2, 3] };
+        assert!(session.draft(&mut good_draft, &mut BadTarget, 4).is_err());
     }
 }

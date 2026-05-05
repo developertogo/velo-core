@@ -1,6 +1,6 @@
 # Velo-Core
 
-Velo-Core is a high-performance speculative inference engine optimized for Apple Silicon. It provides a native Rust implementation of a transformer inference stack, featuring GPU acceleration via Metal, speculative decoding, paged attention, and prefix-aware KV caching.
+> Velo-Core is a high-performance speculative inference engine optimized for Apple Silicon. It provides a native Rust implementation of a transformer inference stack, featuring GPU acceleration via Metal, speculative decoding, paged attention, and prefix-aware KV caching.
 
 ## Key Features
 

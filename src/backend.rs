@@ -19,8 +19,25 @@ pub trait CausalLmBackend {
 
     fn next_logits(&mut self, context: &[TokenId]) -> Result<TokenLogits>;
 
+    fn next_logits_batch(&mut self, contexts: &[&[TokenId]]) -> Result<Vec<TokenLogits>> {
+        contexts
+            .iter()
+            .map(|ctx| self.next_logits(ctx))
+            .collect()
+    }
+
     fn verify_logits(&mut self, context: &[TokenId], drafted: &[TokenId])
     -> Result<Vec<TokenLogits>>;
+
+    fn verify_logits_batch(
+        &mut self,
+        requests: &[(&[TokenId], &[TokenId])],
+    ) -> Result<Vec<Vec<TokenLogits>>> {
+        requests
+            .iter()
+            .map(|(ctx, drafted)| self.verify_logits(ctx, drafted))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -122,6 +139,43 @@ where
 
         Ok(predictions)
     }
+
+    fn draft_batch(
+        &mut self,
+        requests: &[(&[TokenId], usize)],
+    ) -> Result<Vec<Vec<NextTokenPrediction>>> {
+        let sampler = GreedySampler;
+        let mut results: Vec<Vec<NextTokenPrediction>> =
+            requests.iter().map(|(_, max)| Vec::with_capacity(*max)).collect();
+        let mut contexts: Vec<Vec<TokenId>> = requests.iter().map(|(ctx, _)| ctx.to_vec()).collect();
+        let max_steps = requests.iter().map(|(_, max)| *max).max().unwrap_or(0);
+
+        for _ in 0..max_steps {
+            let active_indices: Vec<usize> = requests
+                .iter()
+                .enumerate()
+                .filter(|(i, (_, max))| results[*i].len() < *max)
+                .map(|(i, _)| i)
+                .collect();
+
+            if active_indices.is_empty() {
+                break;
+            }
+
+            let active_contexts: Vec<&[TokenId]> =
+                active_indices.iter().map(|&i| contexts[i].as_slice()).collect();
+
+            let batch_logits = self.backend.next_logits_batch(&active_contexts)?;
+
+            for (batch_idx, &req_idx) in active_indices.iter().enumerate() {
+                let prediction = sampler.sample(&batch_logits[batch_idx]);
+                contexts[req_idx].push(prediction.token);
+                results[req_idx].push(prediction);
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 impl<B> TargetModel for GreedyTargetModel<B>
@@ -145,6 +199,27 @@ where
             .iter()
             .map(|logits| VerifyStep {
                 expected: sampler.sample(logits).token,
+            })
+            .collect())
+    }
+
+    fn verify_batch(
+        &mut self,
+        requests: &[(&[TokenId], &[TokenId])],
+    ) -> Result<Vec<Vec<VerifyStep>>> {
+        let sampler = GreedySampler;
+
+        Ok(self
+            .backend
+            .verify_logits_batch(requests)?
+            .into_iter()
+            .map(|logits_vec| {
+                logits_vec
+                    .into_iter()
+                    .map(|logits| VerifyStep {
+                        expected: sampler.sample(&logits).token,
+                    })
+                    .collect()
             })
             .collect())
     }
@@ -258,5 +333,59 @@ mod tests {
         draft.bind_prefix_cache(&prefix).unwrap();
 
         assert_eq!(draft.backend().bound_prefixes, vec![prefix]);
+    }
+
+    #[test]
+    fn token_logits_rejects_empty_values() {
+        assert!(TokenLogits::new(vec![]).is_err());
+    }
+
+    #[test]
+    fn greedy_sampler_handles_single_logit() {
+        let logits = TokenLogits::new(vec![0.5]).unwrap();
+        let prediction = GreedySampler.sample(&logits);
+        assert_eq!(prediction.token, 0);
+        assert_eq!(prediction.confidence, 0.5);
+    }
+
+    #[test]
+    fn greedy_sampler_picks_last_max() {
+        let logits = TokenLogits::new(vec![0.5, 0.5]).unwrap();
+        let prediction = GreedySampler.sample(&logits);
+        assert_eq!(prediction.token, 1);
+    }
+
+    #[test]
+    fn next_logits_batch_defaults_to_sequential() {
+        struct SequentialBackend;
+        impl CausalLmBackend for SequentialBackend {
+            fn next_logits(&mut self, ctx: &[TokenId]) -> Result<TokenLogits> {
+                TokenLogits::new(vec![ctx.len() as f32])
+            }
+            fn verify_logits(&mut self, _: &[TokenId], _: &[TokenId]) -> Result<Vec<TokenLogits>> {
+                Ok(vec![])
+            }
+        }
+        let mut backend = SequentialBackend;
+        let batch = backend.next_logits_batch(&[&[1], &[1, 2]]).unwrap();
+        assert_eq!(batch[0].values(), &[1.0]);
+        assert_eq!(batch[1].values(), &[2.0]);
+    }
+
+    #[test]
+    fn verify_logits_batch_defaults_to_sequential() {
+        struct SequentialBackend;
+        impl CausalLmBackend for SequentialBackend {
+            fn next_logits(&mut self, _: &[TokenId]) -> Result<TokenLogits> {
+                TokenLogits::new(vec![0.0])
+            }
+            fn verify_logits(&mut self, ctx: &[TokenId], drafted: &[TokenId]) -> Result<Vec<TokenLogits>> {
+                Ok(vec![TokenLogits::new(vec![(ctx.len() + drafted.len()) as f32]).unwrap()])
+            }
+        }
+        let mut backend = SequentialBackend;
+        let batch = backend.verify_logits_batch(&[(&[1], &[2]), (&[1, 2], &[3])]).unwrap();
+        assert_eq!(batch[0][0].values(), &[2.0]);
+        assert_eq!(batch[1][0].values(), &[3.0]);
     }
 }

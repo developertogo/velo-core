@@ -10,7 +10,7 @@ use velo_core::metal::Quantization;
 use velo_core::{EngineConfig, MemoryRuntimeConfig};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args = CliArgs::parse()?;
+    let args = CliArgs::parse(env::args().skip(1))?;
     let engine_config = args.engine_config();
     let mut rows = Vec::new();
 
@@ -57,7 +57,7 @@ struct CliArgs {
 }
 
 impl CliArgs {
-    fn parse() -> Result<Self, String> {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut mode = "prompt-plus-generation".to_string();
         let mut prompt_len = 128usize;
         let mut gen_len = 128usize;
@@ -74,7 +74,7 @@ impl CliArgs {
         let mut format = BenchmarkFormat::Markdown;
         let mut llama_csv = None;
 
-        let mut args = env::args().skip(1).peekable();
+        let mut args = args.peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--mode" => mode = take_value(&mut args, "--mode")?,
@@ -224,4 +224,149 @@ where
     value
         .parse::<usize>()
         .map_err(|error| format!("invalid value for {flag}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_default_args() {
+        let args = vec!["velo-bench".to_string()];
+        let cfg = CliArgs::parse(args.into_iter().skip(1)).unwrap();
+        assert_eq!(cfg.mode, "prompt-plus-generation");
+        assert_eq!(cfg.prompt_len, 128);
+    }
+
+    #[test]
+    fn parses_custom_lengths() {
+        let args = vec![
+            "velo-bench".to_string(),
+            "--prompt-len".to_string(), "1024".to_string(),
+            "--gen-len".to_string(), "256".to_string(),
+        ];
+        let cfg = CliArgs::parse(args.into_iter().skip(1)).unwrap();
+        assert_eq!(cfg.prompt_len, 1024);
+        assert_eq!(cfg.gen_len, 256);
+    }
+
+    #[test]
+    fn rejects_missing_value() {
+        let args = vec!["velo-bench".to_string(), "--prompt-len".to_string()];
+        assert!(CliArgs::parse(args.into_iter().skip(1)).is_err());
+    }
+
+    #[test]
+    fn parses_format() {
+        let args = vec!["velo-bench".to_string(), "--format".to_string(), "csv".to_string()];
+        let cfg = CliArgs::parse(args.into_iter().skip(1)).unwrap();
+        assert_eq!(cfg.format, BenchmarkFormat::Csv);
+    }
+
+    #[test]
+    fn cli_args_modes_all() {
+        let args = CliArgs {
+            mode: "all".to_string(),
+            prompt_len: 128,
+            gen_len: 128,
+            cached_depth: 0,
+            repetitions: 1,
+            warmups: 0,
+            draft_window: 1,
+            bytes_per_token: 0,
+            page_tokens: 16,
+            total_pages: 32,
+            model_name: "".into(),
+            backend_name: "".into(),
+            quantization: Quantization::Q4_0,
+            format: BenchmarkFormat::Markdown,
+            llama_csv: None,
+        };
+        let modes = args.modes();
+        assert_eq!(modes.len(), 3);
+        assert!(modes.contains(&BenchmarkMode::PromptProcessing));
+    }
+
+    #[test]
+    fn cli_args_benchmark_config() {
+        let args = CliArgs {
+            mode: "pp".to_string(),
+            prompt_len: 128,
+            gen_len: 128,
+            cached_depth: 64,
+            repetitions: 1,
+            warmups: 0,
+            draft_window: 1,
+            bytes_per_token: 0,
+            page_tokens: 16,
+            total_pages: 32,
+            model_name: "".into(),
+            backend_name: "".into(),
+            quantization: Quantization::Q4_0,
+            format: BenchmarkFormat::Markdown,
+            llama_csv: None,
+        };
+        let cfg = args.benchmark_config(BenchmarkMode::PromptProcessing);
+        assert_eq!(cfg.prompt_len, 128);
+        assert_eq!(cfg.gen_len, 0);
+        assert_eq!(cfg.cached_depth, 64);
+    }
+
+    #[test]
+    fn parses_all_flags() {
+        let args = vec![
+            "velo-bench".to_string(),
+            "--mode".to_string(), "all".to_string(),
+            "--prompt-len".to_string(), "10".to_string(),
+            "--gen-len".to_string(), "20".to_string(),
+            "--cached-depth".to_string(), "5".to_string(),
+            "--repetitions".to_string(), "2".to_string(),
+            "--warmups".to_string(), "1".to_string(),
+            "--draft-window".to_string(), "4".to_string(),
+            "--bytes-per-token".to_string(), "64".to_string(),
+            "--page-tokens".to_string(), "8".to_string(),
+            "--total-pages".to_string(), "100".to_string(),
+            "--model-name".to_string(), "m".to_string(),
+            "--backend-name".to_string(), "b".to_string(),
+            "--quantization".to_string(), "q4k".to_string(),
+            "--format".to_string(), "json".to_string(),
+        ];
+        let cfg = CliArgs::parse(args.into_iter().skip(1)).unwrap();
+        assert_eq!(cfg.mode, "all");
+        assert_eq!(cfg.quantization, Quantization::Q4K);
+        assert_eq!(cfg.format, BenchmarkFormat::Json);
+    }
+
+    #[test]
+    fn rejects_invalid_values() {
+        let mut args = vec!["velo-bench".to_string(), "--prompt-len".to_string(), "abc".to_string()];
+        assert!(CliArgs::parse(args.clone().into_iter().skip(1)).is_err());
+        
+        args = vec!["velo-bench".to_string(), "--format".to_string(), "unknown".to_string()];
+        assert!(CliArgs::parse(args.clone().into_iter().skip(1)).is_err());
+        
+        args = vec!["velo-bench".to_string(), "--quantization".to_string(), "unknown".to_string()];
+        assert!(CliArgs::parse(args.clone().into_iter().skip(1)).is_err());
+        
+        args = vec!["velo-bench".to_string(), "--unknown".to_string()];
+        assert!(CliArgs::parse(args.clone().into_iter().skip(1)).is_err());
+    }
+
+    #[test]
+    fn help_output_is_not_empty() {
+        assert!(!CliArgs::help().is_empty());
+    }
+
+    #[test]
+    fn modes_mapping() {
+        let mut args = CliArgs::parse(vec![].into_iter()).unwrap();
+        args.mode = "pp".to_string();
+        assert_eq!(args.modes(), vec![BenchmarkMode::PromptProcessing]);
+        args.mode = "tg".to_string();
+        assert_eq!(args.modes(), vec![BenchmarkMode::Generation]);
+        args.mode = "pg".to_string();
+        assert_eq!(args.modes(), vec![BenchmarkMode::PromptPlusGeneration]);
+        args.mode = "unknown".to_string();
+        assert_eq!(args.modes(), vec![BenchmarkMode::PromptPlusGeneration]);
+    }
 }

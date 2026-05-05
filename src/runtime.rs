@@ -147,3 +147,45 @@ impl PagedBlockAllocator for PagedAttentionBlockManager {
         PagedAttentionBlockManager::materialize_span(self, handle)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_cpu_vs_gpu() {
+        let cpu = MemoryRuntimeConfig::cpu(64, 16, 32, 1, 32);
+        assert!(!cpu.unified_memory);
+        let gpu = MemoryRuntimeConfig::new(64, 16, 32, 1, 32);
+        assert!(gpu.unified_memory);
+    }
+
+    #[test]
+    fn runtime_accessors() {
+        let config = MemoryRuntimeConfig::cpu(64, 16, 32, 1, 32);
+        let mut rt = CpuMemoryRuntime::new(config).unwrap();
+        
+        assert_eq!(rt.store().allocated_bytes(), 0);
+        assert_eq!(rt.store_mut().allocated_bytes(), 0);
+        assert_eq!(rt.allocator().free_pages(), 32);
+        assert_eq!(rt.allocator_mut().free_pages(), 32);
+        
+        rt.bind_slot(crate::slot_manager::SlotId(0), &[]).unwrap();
+        assert!(format!("{:?}", rt).contains("CpuMemoryRuntime"));
+    }
+
+    #[test]
+    fn runtime_error_on_invalid_config() {
+        let config = MemoryRuntimeConfig::cpu(64, 0, 32, 1, 32); // block_size 0 is invalid
+        assert!(CpuMemoryRuntime::new(config).is_err());
+    }
+    
+    #[test]
+    fn trait_materialize() {
+        let config = MemoryRuntimeConfig::cpu(64, 16, 32, 1, 32);
+        let mut rt = CpuMemoryRuntime::new(config).unwrap();
+        let h = KvCacheHandle { block_id: 1, token_len: 1 };
+        assert!(rt.allocator().materialize_span(h).is_none());
+        assert!(rt.allocator_mut().release(h).is_err());
+    }
+}

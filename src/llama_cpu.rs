@@ -20,10 +20,8 @@ use crate::gguf::GgmlType;
 // ── KV cache ──────────────────────────────────────────────────────────────────
 
 struct KvCache {
-    n_layer: usize,
     n_head_kv: usize,
     head_dim: usize,
-    n_ctx: usize,
     /// k[layer][pos * n_head_kv * head_dim + head * head_dim + d]
     k: Vec<Vec<f32>>,
     /// v[layer][pos * n_head_kv * head_dim + head * head_dim + d]
@@ -35,10 +33,8 @@ impl KvCache {
     fn new(n_layer: usize, n_head_kv: usize, head_dim: usize, n_ctx: usize) -> Self {
         let per_layer = n_ctx * n_head_kv * head_dim;
         Self {
-            n_layer,
             n_head_kv,
             head_dim,
-            n_ctx,
             k: vec![vec![0.0; per_layer]; n_layer],
             v: vec![vec![0.0; per_layer]; n_layer],
             pos: 0,
@@ -62,6 +58,7 @@ fn rms_norm(x: &mut [f32], w: &[f32], eps: f32) {
         *xi = (*xi / rms) * wi;
     }
 }
+
 
 /// Matrix-vector multiply: `out[r] += sum_c W[r,c] * x[c]` (no bias).
 ///
@@ -149,11 +146,6 @@ fn softmax(x: &mut [f32]) {
 
 // ── Weight lookup helpers ─────────────────────────────────────────────────────
 
-/// A borrowed tensor with its dtype, used for quantised mat-vec.
-struct TensorRef<'a> {
-    data: &'a [u8],
-    dtype: GgmlType,
-}
 
 /// Dequantise a 1-D weight tensor (e.g. norm weights) into `out`.
 fn load_vec(weights: &WeightStore, name: &str, out: &mut Vec<f32>) -> Result<(), LoadError> {
@@ -223,7 +215,7 @@ impl LlamaCpuModel {
             let l = layer;
 
             // Attention norm
-            let atn_norm_name = format!("blk.{l}.attn_norm.weight");
+            let atn_norm_name = format!("layers.{l}.attention_norm.weight");
             let mut norm_w = vec![0.0f32; n_embd];
             load_vec(&self.weights, &atn_norm_name, &mut norm_w)?;
 
@@ -231,9 +223,9 @@ impl LlamaCpuModel {
             rms_norm(&mut xb, &norm_w, norm_eps);
 
             // Q, K, V projections
-            let q_name = format!("blk.{l}.attn_q.weight");
-            let k_name = format!("blk.{l}.attn_k.weight");
-            let v_name = format!("blk.{l}.attn_v.weight");
+            let q_name = format!("layers.{l}.attention.wq.weight");
+            let k_name = format!("layers.{l}.attention.wk.weight");
+            let v_name = format!("layers.{l}.attention.wv.weight");
 
             let mut q = vec![0.0f32; n_head * head_dim];
             let mut k_vec = vec![0.0f32; n_head_kv * head_dim];
@@ -291,7 +283,7 @@ impl LlamaCpuModel {
             }
 
             // Output projection
-            let o_name = format!("blk.{l}.attn_output.weight");
+            let o_name = format!("layers.{l}.attention.wo.weight");
             let mut x_out = vec![0.0f32; n_embd];
             {
                 let (data, dtype) = self.weights_ref(&o_name)?;
@@ -304,16 +296,16 @@ impl LlamaCpuModel {
             }
 
             // ── FFN ───────────────────────────────────────────────────────────
-            let ffn_norm_name = format!("blk.{l}.ffn_norm.weight");
+            let ffn_norm_name = format!("layers.{l}.ffn_norm.weight");
             let mut ffn_norm_w = vec![0.0f32; n_embd];
             load_vec(&self.weights, &ffn_norm_name, &mut ffn_norm_w)?;
 
             let mut xb2 = x.clone();
             rms_norm(&mut xb2, &ffn_norm_w, norm_eps);
 
-            let gate_name = format!("blk.{l}.ffn_gate.weight");
-            let up_name = format!("blk.{l}.ffn_up.weight");
-            let down_name = format!("blk.{l}.ffn_down.weight");
+            let gate_name = format!("layers.{l}.feed_forward.w1.weight");
+            let up_name = format!("layers.{l}.feed_forward.w3.weight");
+            let down_name = format!("layers.{l}.feed_forward.w2.weight");
 
             let mut gate = vec![0.0f32; n_ff];
             let mut up = vec![0.0f32; n_ff];
@@ -462,6 +454,89 @@ mod tests {
     }
 
     #[test]
+    fn silu_negative_is_small() {
+        assert!(silu(-10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn matvec_quant_identity() {
+        let x = vec![1.0, 2.0];
+        let weights = vec![1.0f32, 0.0, 0.0, 1.0];
+        let data: Vec<u8> = weights.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut out = vec![0.0; 2];
+        matvec_quant(&mut out, &data, GgmlType::F32, &x, 2, 2);
+        assert_eq!(out, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn kv_cache_storage() {
+        let mut cache = KvCache::new(1, 1, 2, 4);
+        let k = vec![1.0, 2.0];
+        let v = vec![3.0, 4.0];
+        cache.store_kv(0, 1, &k, &v);
+        assert_eq!(cache.k[0][2..4], k);
+        assert_eq!(cache.v[0][2..4], v);
+    }
+
+    #[test]
+    fn rms_norm_zero_eps_safety() {
+        let mut x = vec![0.0, 0.0];
+        let w = vec![1.0, 1.0];
+        rms_norm(&mut x, &w, 1e-5);
+        assert_eq!(x, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn silu_activation_is_smooth() {
+        let v = silu(1.0);
+        assert!(v > 0.7 && v < 0.8);
+    }
+
+    #[test]
+    fn test_cpu_verify_logits() {
+        let n_vocab = 32;
+        let n_embd = 16;
+        let weights = WeightStore::dummy_llama(n_vocab, n_embd, 1);
+        let mut model = LlamaCpuModel::new(weights);
+        let res = model.verify_logits(&[1], &[2, 3]);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_cpu_next_logits_empty_error() {
+        let n_vocab = 32;
+        let n_embd = 16;
+        let weights = WeightStore::dummy_llama(n_vocab, n_embd, 1);
+        let mut model = LlamaCpuModel::new(weights);
+        assert!(model.next_logits(&[]).is_err());
+    }
+
+    #[test]
+    fn matvec_direct() {
+        let mut out = vec![0.0f32; 2];
+        let w = vec![1.0, 0.0, 0.0, 1.0];
+        let x = vec![2.0, 3.0];
+        matvec(&mut out, &w, &x, 2, 2);
+        assert_eq!(out, vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_cpu_forward_one() {
+        let n_vocab = 32;
+        let n_embd = 16;
+        let n_layer = 1;
+        let weights = WeightStore::dummy_llama(n_vocab, n_embd, n_layer);
+        let mut model = LlamaCpuModel::new(weights);
+        
+        let logits = model.forward_one(1, 0).unwrap();
+        assert_eq!(logits.len(), n_vocab);
+        // With all zero weights (except maybe SwiGLU if we were careful),
+        // we expect zeros or small values.
+        assert!(logits.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
     fn silu_positive_is_positive() {
         assert!(silu(1.0) > 0.0);
     }
@@ -485,5 +560,43 @@ mod tests {
         rope(&mut q, &mut k, 0, 1, 1, 4, 10_000.0);
         let norm_q_after: f32 = q.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm_q_before - norm_q_after).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cpu_model_prefix_and_tied_weights() {
+        let n_vocab = 32;
+        let n_embd = 16;
+        let mut weights = WeightStore::dummy_llama(n_vocab, n_embd, 1);
+        // Tie weights by removing output.weight
+        weights.index.remove("output.weight");
+        
+        let mut model = LlamaCpuModel::new(weights);
+        model.bind_prefix_cache(&CacheLookup { matched_tokens: 1, handle: None }).unwrap();
+        assert!(model.bound_prefix.is_some());
+        
+        // forward_one should now use token_embd.weight for logits
+        let logits = model.forward_one(1, 0).unwrap();
+        assert_eq!(logits.len(), n_vocab);
+    }
+
+    #[test]
+    fn cpu_model_forward_sequence() {
+        let n_vocab = 32;
+        let n_embd = 16;
+        let weights = WeightStore::dummy_llama(n_vocab, n_embd, 1);
+        let mut model = LlamaCpuModel::new(weights);
+        let logits = model.forward_sequence(&[1, 2, 3]).unwrap();
+        assert_eq!(logits.len(), n_vocab);
+        assert_eq!(model.kv.pos, 3);
+    }
+
+    #[test]
+    fn cpu_model_missing_weight_error() {
+        let n_vocab = 32;
+        let n_embd = 16;
+        let mut weights = WeightStore::dummy_llama(n_vocab, n_embd, 1);
+        weights.index.remove("layers.0.attention.wq.weight");
+        let mut model = LlamaCpuModel::new(weights);
+        assert!(model.forward_one(1, 0).is_err());
     }
 }

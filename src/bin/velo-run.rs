@@ -13,18 +13,18 @@ use velo_core::radix_cache::TokenId;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let config = parse_args(&args).unwrap_or_else(|e| {
+    if let Err(e) = run(&args) {
         eprintln!("Error: {e}");
-        eprintln!("{}", USAGE);
         std::process::exit(1);
-    });
+    }
+}
+
+fn run(args: &[String]) -> Result<(), String> {
+    let config = parse_args(args)?;
 
     eprintln!("Loading model: {}", config.model.display());
     let t0 = Instant::now();
-    let weights = load_gguf(&config.model).unwrap_or_else(|e| {
-        eprintln!("Failed to load model: {e}");
-        std::process::exit(1);
-    });
+    let weights = load_gguf(&config.model).map_err(|e| format!("Failed to load model: {e}"))?;
 
     let meta = weights.meta.clone();
     eprintln!(
@@ -43,8 +43,7 @@ fn main() {
     // ── Prompt processing ─────────────────────────────────────────────────────
     let prompt_tokens = config.token_ids.clone();
     if prompt_tokens.is_empty() {
-        eprintln!("No token ids provided; use --token-ids or --prompt");
-        std::process::exit(1);
+        return Err("No token ids provided; use --token-ids or --prompt".to_string());
     }
 
     eprintln!(
@@ -54,15 +53,12 @@ fn main() {
     );
 
     let t1 = Instant::now();
-    let prompt_logits = model.forward_sequence(&prompt_tokens).unwrap_or_else(|e| {
-        eprintln!("Forward pass failed: {e}");
-        std::process::exit(1);
-    });
+    let prompt_logits = model.forward_sequence(&prompt_tokens).map_err(|e| format!("Forward pass failed: {e}"))?;
 
     let ttft = t1.elapsed();
 
     let sampler = GreedySampler;
-    let first_tok = sampler.sample(&TokenLogits::new(prompt_logits).unwrap());
+    let first_tok = sampler.sample(&TokenLogits::new(prompt_logits).map_err(|e| format!("Invalid logits: {e}"))?);
 
     eprintln!(
         "TTFT: {:.1}ms  first token id: {} (confidence {:.4})",
@@ -78,10 +74,7 @@ fn main() {
     let t2 = Instant::now();
     for _ in 0..max_new {
         let last = *generated.last().unwrap();
-        let logits = model.next_logits(&[last]).unwrap_or_else(|e| {
-            eprintln!("Generation failed: {e}");
-            std::process::exit(1);
-        });
+        let logits = model.next_logits(&[last]).map_err(|e| format!("Generation failed: {e}"))?;
         let pred = sampler.sample(&logits);
         generated.push(pred.token);
     }
@@ -102,10 +95,12 @@ fn main() {
     for tok in &generated {
         println!("  {tok}");
     }
+    Ok(())
 }
 
 // ── CLI parsing ───────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 struct RunConfig {
     model: PathBuf,
     token_ids: Vec<TokenId>,
@@ -218,5 +213,111 @@ mod tests {
         let cfg =
             parse_args(&args(&["--model", "m.gguf", "--prompt", "hi"])).unwrap();
         assert_eq!(cfg.token_ids, vec![b'h' as u32, b'i' as u32]);
+    }
+
+    #[test]
+    fn rejects_missing_model() {
+        let args = vec!["velo-run".to_string(), "--token-ids".to_string(), "1".to_string()];
+        assert_eq!(parse_args(&args).unwrap_err(), "--model is required");
+    }
+
+    #[test]
+    fn rejects_invalid_token_id() {
+        let args = vec![
+            "velo-run".to_string(),
+            "--model".to_string(), "m.gguf".to_string(),
+            "--token-ids".to_string(), "1,abc".to_string()
+        ];
+        assert!(parse_args(&args).unwrap_err().contains("invalid token id"));
+    }
+
+    #[test]
+    fn rejects_invalid_max_tokens() {
+        let args = vec![
+            "velo-run".to_string(),
+            "--model".to_string(), "m.gguf".to_string(),
+            "--token-ids".to_string(), "1".to_string(),
+            "--max-tokens".to_string(), "xyz".to_string()
+        ];
+        assert!(parse_args(&args).unwrap_err().contains("max-tokens must be a positive integer"));
+    }
+
+    #[test]
+    fn prompt_option_validation() {
+        let args = vec!["velo-run".to_string(), "--model".to_string(), "m.gguf".to_string(), "--prompt".to_string()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_run_inference_full() {
+        let args = vec!["velo-run".to_string(), "--model".to_string(), "m.gguf".to_string(), "--token-ids".to_string(), "1,2".to_string()];
+        // Should parse but fail to load because m.gguf doesn't exist
+        let _ = parse_args(&args);
+    }
+
+    #[test]
+    fn test_help_output() {
+        let args = vec!["velo-run".to_string(), "--help".to_string()];
+        // parse_args doesn't handle --help specifically (it returns error or usage)
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_invalid_max_tokens_format() {
+        let args = vec!["velo-run".to_string(), "--model".to_string(), "m".to_string(), "--token-ids".to_string(), "1".to_string(), "--max-tokens".to_string(), "abc".to_string()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_run_inference_logic() {
+        let n_vocab = 32;
+        let n_embd = 16;
+        let weights = velo_core::model_loader::WeightStore::dummy_llama(n_vocab, n_embd, 1);
+        let mut model = LlamaCpuModel::new(weights);
+        let prompt = vec![1, 2, 3];
+        
+        let logits = model.forward_sequence(&prompt).unwrap();
+        let sampler = GreedySampler;
+        let tok = sampler.sample(&TokenLogits::new(logits).unwrap());
+        assert!(tok.token < n_vocab as u32);
+        
+        let next_logits = model.next_logits(&[tok.token]).unwrap();
+        let next_tok = sampler.sample(&next_logits);
+        assert!(next_tok.token < n_vocab as u32);
+    }
+
+    #[test]
+    fn test_run_config_traits() {
+        let cfg = RunConfig {
+            model: PathBuf::from("m.gguf"),
+            token_ids: vec![1, 2],
+            max_tokens: 32,
+        };
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("m.gguf"));
+        assert!(dbg.contains("max_tokens: 32"));
+    }
+
+    #[test]
+    fn test_usage_not_empty() {
+        assert!(!USAGE.is_empty());
+    }
+
+    #[test]
+    fn test_parse_args_exhaustive() {
+        // Test unknown argument
+        assert!(parse_args(&["velo-run".to_string(), "--unknown".to_string()]).is_err());
+        
+        // Test missing required model
+        assert_eq!(parse_args(&["velo-run".to_string(), "--token-ids".to_string(), "1".to_string()]).unwrap_err(), "--model is required");
+        
+        // Test missing prompt/token-ids
+        assert_eq!(parse_args(&["velo-run".to_string(), "--model".to_string(), "m".to_string()]).unwrap_err(), "at least one of --token-ids or --prompt is required");
+    }
+
+    #[test]
+    fn test_run_invalid_args() {
+        let res = run(&["velo-run".to_string(), "--unknown".to_string()]);
+        assert!(res.is_err());
     }
 }

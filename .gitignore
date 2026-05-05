@@ -28,3 +28,6 @@ skills-lock.json
 
 # log
 *.log
+
+# test coverage 
+/coverage_report/

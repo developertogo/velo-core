@@ -15,38 +15,33 @@ use velo_core::radix_cache::TokenId;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let config = parse_args(&args).unwrap_or_else(|e| {
+    if let Err(e) = run(&args) {
         eprintln!("Error: {e}");
-        eprintln!("{}", USAGE);
         std::process::exit(1);
-    });
+    }
+}
+
+fn run(args: &[String]) -> Result<(), String> {
+    let config = parse_args(args)?;
 
     if config.mock {
         run_mock(config);
-        return;
+        return Ok(());
     }
 
     let Some(target_path) = &config.target else {
-        eprintln!("Error: --target missing and --mock not specified");
-        std::process::exit(1);
+        return Err("--target missing and --mock not specified".to_string());
     };
     let Some(draft_path) = &config.draft else {
-        eprintln!("Error: --draft missing and --mock not specified");
-        std::process::exit(1);
+        return Err("--draft missing and --mock not specified".to_string());
     };
 
     eprintln!("Loading target model: {}", target_path.display());
     let t0 = Instant::now();
-    let target_weights = load_gguf(target_path).unwrap_or_else(|e| {
-        eprintln!("Failed to load target model: {e}");
-        std::process::exit(1);
-    });
+    let target_weights = load_gguf(target_path).map_err(|e| format!("Failed to load target model: {e}"))?;
     
     eprintln!("Loading draft model: {}", draft_path.display());
-    let draft_weights = load_gguf(draft_path).unwrap_or_else(|e| {
-        eprintln!("Failed to load draft model: {e}");
-        std::process::exit(1);
-    });
+    let draft_weights = load_gguf(draft_path).map_err(|e| format!("Failed to load draft model: {e}"))?;
 
     let target_meta = target_weights.meta.clone();
     eprintln!(
@@ -68,7 +63,7 @@ fn main() {
         model_name: "target".to_string(),
         memory: MemoryRuntimeConfig::cpu(kv_bytes_per_token, 16, 256, target_meta.n_layer, 32),
         quantization: target_meta.quantization,
-    }).unwrap();
+    }).map_err(|e| format!("Failed to create runtime: {e}"))?;
 
     let mut target_backend = MetalBackend::new(MetalBackendConfig {
         model_name: "target".to_string(),
@@ -76,8 +71,8 @@ fn main() {
         kv_bytes_per_token,
         paged_block_size: 16,
         quantization: target_meta.quantization,
-    }).unwrap();
-    target_backend.wire(target_weights, &target_runtime).unwrap();
+    }).map_err(|e| format!("Failed to create target backend: {e}"))?;
+    target_backend.wire(target_weights, &target_runtime).map_err(|e| format!("Failed to wire target: {e}"))?;
 
     let mut draft_backend = MetalBackend::new(MetalBackendConfig {
         model_name: "draft".to_string(),
@@ -85,10 +80,10 @@ fn main() {
         kv_bytes_per_token,
         paged_block_size: 16,
         quantization: draft_weights.meta.quantization,
-    }).unwrap();
+    }).map_err(|e| format!("Failed to create draft backend: {e}"))?;
     
     // For simplicity, we reuse the target runtime's context if they are both unified
-    draft_backend.wire(draft_weights, &target_runtime).unwrap();
+    draft_backend.wire(draft_weights, &target_runtime).map_err(|e| format!("Failed to wire draft: {e}"))?;
 
     let mut engine = VeloEngine::with_runtime(
         EngineConfig {
@@ -96,7 +91,7 @@ fn main() {
             memory: target_runtime.context().memory,
         },
         target_runtime,
-    ).unwrap();
+    ).map_err(|e| format!("Failed to create engine: {e}"))?;
 
     let mut draft_model = GreedyDraftModel::new(draft_backend);
     let mut target_model = GreedyTargetModel::new(target_backend);
@@ -111,7 +106,7 @@ fn main() {
         &mut target_model,
         &prompt_tokens,
         config.max_new_tokens,
-    ).unwrap();
+    ).map_err(|e| format!("Generation failed: {e}"))?;
     let elapsed = t1.elapsed();
 
     eprintln!(
@@ -127,6 +122,7 @@ fn main() {
     for tok in &output.tokens {
         println!("  {tok}");
     }
+    Ok(())
 }
 
 fn run_mock(config: SpecConfig) {
@@ -162,6 +158,7 @@ fn run_mock(config: SpecConfig) {
     }
 }
 
+#[derive(Debug, Clone)]
 struct SpecConfig {
     target: Option<PathBuf>,
     draft: Option<PathBuf>,
@@ -203,11 +200,11 @@ fn parse_args(args: &[String]) -> Result<SpecConfig, String> {
             }
             "--max-new" => {
                 i += 1;
-                max_new_tokens = args.get(i).ok_or("--max-new requires a value")?.parse().unwrap();
+                max_new_tokens = args.get(i).ok_or("--max-new requires a value")?.parse().map_err(|e| format!("invalid max-new: {}", e))?;
             }
             "--window" => {
                 i += 1;
-                draft_window = args.get(i).ok_or("--window requires a value")?.parse().unwrap();
+                draft_window = args.get(i).ok_or("--window requires a value")?.parse().map_err(|e| format!("invalid window: {}", e))?;
             }
             "--mock" => {
                 mock = true;
@@ -226,4 +223,121 @@ fn parse_args(args: &[String]) -> Result<SpecConfig, String> {
         max_context,
         mock,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(pairs: &[&str]) -> Vec<String> {
+        let mut v = vec!["velo-spec".to_string()];
+        v.extend(pairs.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn parses_mock_spec() {
+        let cfg = parse_args(&args(&["--mock", "--prompt", "hi"])).unwrap();
+        assert!(cfg.mock);
+        assert_eq!(cfg.token_ids, vec![b'h' as u32, b'i' as u32]);
+    }
+
+    #[test]
+    fn parses_full_spec() {
+        let cfg = parse_args(&args(&[
+            "--target", "t.gguf",
+            "--draft", "d.gguf",
+            "--prompt", "p",
+            "--max-new", "64",
+            "--window", "8",
+        ])).unwrap();
+        assert_eq!(cfg.target, Some(PathBuf::from("t.gguf")));
+        assert_eq!(cfg.draft, Some(PathBuf::from("d.gguf")));
+        assert_eq!(cfg.max_new_tokens, 64);
+        assert_eq!(cfg.draft_window, 8);
+    }
+
+    #[test]
+    fn rejects_unknown_arg() {
+        assert!(parse_args(&args(&["--bad"])).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_target_or_draft() {
+        let args = vec!["velo-spec".to_string(), "--prompt".to_string(), "hi".to_string()];
+        let cfg = parse_args(&args).unwrap();
+        assert_eq!(cfg.target, None);
+        assert_eq!(cfg.draft, None);
+    }
+
+    #[test]
+    fn rejects_missing_values() {
+        assert!(parse_args(&vec!["velo-spec".to_string(), "--target".to_string()]).is_err());
+        assert!(parse_args(&vec!["velo-spec".to_string(), "--draft".to_string()]).is_err());
+        assert!(parse_args(&vec!["velo-spec".to_string(), "--prompt".to_string()]).is_err());
+        assert!(parse_args(&vec!["velo-spec".to_string(), "--max-new".to_string()]).is_err());
+        assert!(parse_args(&vec!["velo-spec".to_string(), "--window".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_run_mock_full() {
+        let cfg = SpecConfig {
+            target: None,
+            draft: None,
+            token_ids: vec![1, 2, 3],
+            max_new_tokens: 10,
+            draft_window: 4,
+            max_context: 4096,
+            mock: true,
+        };
+        run_mock(cfg);
+    }
+
+    #[test]
+    fn test_invalid_max_new_format() {
+        let args = vec!["velo-spec".to_string(), "--prompt".to_string(), "h".to_string(), "--max-new".to_string(), "nan".to_string()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_invalid_window_format() {
+        let args = vec!["velo-spec".to_string(), "--prompt".to_string(), "h".to_string(), "--window".to_string(), "nan".to_string()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_spec_config_traits() {
+        let cfg = SpecConfig {
+            target: Some(PathBuf::from("t")),
+            draft: Some(PathBuf::from("d")),
+            token_ids: vec![1],
+            max_new_tokens: 10,
+            draft_window: 4,
+            max_context: 2048,
+            mock: false,
+        };
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("max_new_tokens: 10"));
+        assert!(dbg.contains("mock: false"));
+    }
+
+    #[test]
+    fn test_usage_not_empty() {
+        assert!(!USAGE.is_empty());
+    }
+
+    #[test]
+    fn test_parse_args_missing_values_direct() {
+        assert!(parse_args(&["velo-spec".to_string(), "--target".to_string()]).is_err());
+        assert!(parse_args(&["velo-spec".to_string(), "--draft".to_string()]).is_err());
+        assert!(parse_args(&["velo-spec".to_string(), "--prompt".to_string()]).is_err());
+        assert!(parse_args(&["velo-spec".to_string(), "--max-new".to_string()]).is_err());
+        assert!(parse_args(&["velo-spec".to_string(), "--window".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_run_invalid_args() {
+        let res = run(&["velo-spec".to_string(), "--unknown".to_string()]);
+        assert!(res.is_err());
+    }
 }

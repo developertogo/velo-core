@@ -134,4 +134,12 @@ mod tests {
         let s1_new = pool.alloc().unwrap();
         assert_eq!(s1_new.0, 1);
     }
+
+    #[test]
+    fn test_slot_id_traits() {
+        let id = SlotId(1);
+        let id2 = id.clone();
+        assert_eq!(id, id2);
+        assert!(format!("{:?}", id).contains("SlotId"));
+    }
 }
