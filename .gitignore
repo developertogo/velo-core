@@ -29,5 +29,5 @@ skills-lock.json
 # log
 *.log
 
-# test coverage 
+# test coverage
 /coverage_report/
