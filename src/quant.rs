@@ -280,4 +280,56 @@ mod tests {
         let out = dequant_matrix(GgmlType::F32, &data, 2, 2);
         assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0]);
     }
+
+    #[test]
+    fn dequant_q4k_basic_zeros() {
+        let block = vec![0u8; 144];
+        let mut out = vec![0.0f32; 256];
+        dequant_q4k_row(&block, &mut out);
+        for v in &out {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn dequant_row_dispatch_bf16() {
+        let values = [1.0f32, 2.0];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect();
+        let mut out = vec![0.0; 2];
+        dequant_row(GgmlType::BF16, &bytes, &mut out);
+        assert_eq!(out, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn dequant_row_dispatch_fallback_zeros() {
+        let mut out = vec![1.0; 4];
+        dequant_row(GgmlType::Q8_0, &[0; 100], &mut out);
+        assert_eq!(out, vec![0.0; 4]);
+    }
+
+    #[test]
+    fn f16_edge_cases() {
+        // Subnormal
+        assert_eq!(f16_to_f32(0x0001), 1.0 / (1u32 << 24) as f32);
+        assert_eq!(f16_to_f32(0x8001), -(1.0 / (1u32 << 24) as f32));
+        
+        // Infinity
+        assert!(f16_to_f32(0x7C00).is_infinite());
+        assert!(f16_to_f32(0xFC00).is_infinite());
+        
+        // NaN
+        assert!(f16_to_f32(0x7C01).is_nan());
+    }
+
+    #[test]
+    fn dequant_f16_matrix_multi_row() {
+        let values = [1.0f32, 2.0, 3.0, 4.0];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| {
+            // bits for 1.0 are 0x3C00
+            let bits: u16 = if *v == 1.0 { 0x3C00 } else if *v == 2.0 { 0x4000 } else if *v == 3.0 { 0x4200 } else { 0x4400 };
+            bits.to_le_bytes()
+        }).collect();
+        let out = dequant_matrix(GgmlType::F16, &bytes, 2, 2);
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0]);
+    }
 }

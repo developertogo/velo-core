@@ -173,6 +173,25 @@ mod tests {
     }
 
     #[test]
+    fn paged_attention_error_display() {
+        assert!(format!("{}", PageManagerError::InvalidBlockSize).contains("block size"));
+        assert!(format!("{}", PageManagerError::OutOfPages { requested: 10, available: 5 }).contains("requested 10 pages"));
+        assert!(format!("{}", PageManagerError::UnknownHandle(KvCacheHandle { block_id: 99, token_len: 0 })).contains("unknown KV handle 99"));
+    }
+
+    #[test]
+    fn materialize_span_miss() {
+        let mgr = PagedAttentionBlockManager::new(PagedAttentionConfig::new(16, 32).unwrap());
+        assert!(mgr.materialize_span(KvCacheHandle { block_id: 1, token_len: 0 }).is_none());
+    }
+
+    #[test]
+    fn free_pages_access() {
+        let mgr = PagedAttentionBlockManager::new(PagedAttentionConfig::new(16, 32).unwrap());
+        assert_eq!(mgr.free_pages(), 32);
+    }
+
+    #[test]
     fn release_returns_pages_to_pool() {
         let config = PagedAttentionConfig::new(8, 2).unwrap();
         let mut manager = PagedAttentionBlockManager::new(config);
@@ -205,5 +224,41 @@ mod tests {
                 available: 1
             }
         ));
+    }
+
+    #[test]
+    fn config_error_and_accessors() {
+        assert!(PagedAttentionConfig::new(0, 1).is_err());
+        let config = PagedAttentionConfig::new(16, 32).unwrap();
+        let mgr = PagedAttentionBlockManager::new(config);
+        assert_eq!(mgr.config().block_size, 16);
+    }
+
+    #[test]
+    fn mapped_pages_miss() {
+        let mgr = PagedAttentionBlockManager::new(PagedAttentionConfig::new(16, 32).unwrap());
+        assert!(mgr.mapped_pages(KvCacheHandle { block_id: 1, token_len: 0 }).is_none());
+    }
+
+    #[test]
+    fn release_error() {
+        let mut mgr = PagedAttentionBlockManager::new(PagedAttentionConfig::new(16, 32).unwrap());
+        assert!(mgr.release(KvCacheHandle { block_id: 1, token_len: 0 }).is_err());
+    }
+
+    #[test]
+    fn trait_impls() {
+        let span = PageSpan { pages: vec![PageId(1)] };
+        let span2 = span.clone();
+        assert_eq!(span, span2);
+        assert!(format!("{:?}", span).contains("PageId"));
+        
+        let mapping = BlockMapping {
+            handle: KvCacheHandle { block_id: 1, token_len: 1 },
+            pages: vec![PageId(1)],
+            token_len: 1,
+        };
+        let mapping2 = mapping.clone();
+        assert_eq!(mapping, mapping2);
     }
 }

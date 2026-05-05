@@ -41,6 +41,29 @@ pub struct EngineOutput {
     pub stats: EngineStats,
 }
 
+/// A request to be processed in a batch.
+#[derive(Debug, Clone)]
+pub struct BatchRequest {
+    /// The prompt tokens.
+    pub prompt: Vec<TokenId>,
+    /// Maximum number of new tokens to generate.
+    pub max_new_tokens: usize,
+}
+
+/// Internal state for a request currently being processed in a batch.
+pub struct ActiveRequest {
+    /// The speculative decoding session.
+    pub session: crate::speculative::SpeculativeSession,
+    /// The GPU slot assigned to this request.
+    pub slot_id: crate::slot_manager::SlotId,
+    /// Maximum number of new tokens to generate.
+    pub max_new_tokens: usize,
+    /// Tokens generated so far.
+    pub generated: Vec<TokenId>,
+    /// Prefill results (prefix cache hits/misses).
+    pub prefill: EnginePrefillOutput,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnginePrefillOutput {
     pub cached_prefix: CacheLookup,
@@ -97,60 +120,177 @@ where
         max_new_tokens: usize,
     ) -> Result<EngineOutput, EngineError>
     where
-        D: DraftModel,
-        T: TargetModel,
+        D: crate::speculative::DraftModel,
+        T: crate::speculative::TargetModel,
     {
-        let slot_id = self.slot_pool.alloc().ok_or_else(|| {
-            EngineError::Speculative(SpeculativeError::Model("No free slots available".to_string()))
-        })?;
+        let outputs = self.generate_batch(
+            draft_model,
+            target_model,
+            vec![BatchRequest {
+                prompt: prompt.to_vec(),
+                max_new_tokens,
+            }],
+        )?;
 
-        let prefill = self.prefill(prompt)?;
+        Ok(outputs.into_iter().next().unwrap())
+    }
 
-        // Materialize the full page sequence for the slot
-        let pages = prefill.inserted_pages.as_ref()
-            .or(prefill.cached_pages.as_ref())
-            .ok_or_else(|| EngineError::Speculative(SpeculativeError::Model("Failed to resolve pages for prefill".to_string())))?;
-        
-        let page_ids: Vec<u32> = pages.pages.iter().map(|p| p.0 as u32).collect();
-        self.runtime.bind_slot(slot_id, &page_ids)?;
+    /// Generates tokens for multiple requests concurrently using speculative decoding.
+    ///
+    /// This method orchestrates the draft-and-verify loop for all requests in the batch.
+    /// It leverages the `SlotPool` for memory isolation and handles asynchronous finishing
+    /// (requests can have different `max_new_tokens` or finish early).
+    pub fn generate_batch<D, T>(
+        &mut self,
+        draft_model: &mut D,
+        target_model: &mut T,
+        requests: Vec<BatchRequest>,
+    ) -> Result<Vec<EngineOutput>, EngineError>
+    where
+        D: crate::speculative::DraftModel,
+        T: crate::speculative::TargetModel,
+    {
+        let mut active = Vec::with_capacity(requests.len());
 
-        draft_model.bind_slot(slot_id)?;
-        target_model.bind_slot(slot_id)?;
-        draft_model.bind_prefix_cache(&prefill.cached_prefix)?;
-        target_model.bind_prefix_cache(&prefill.cached_prefix)?;
+        for req in requests {
+            let slot_id = self.slot_pool.alloc().ok_or_else(|| {
+                EngineError::Speculative(crate::speculative::SpeculativeError::Model(
+                    "No free slots available".to_string(),
+                ))
+            })?;
 
-        let decoded =
-            self.decoder
-                .generate(draft_model, target_model, prompt, max_new_tokens)?;
+            let prefill = self.prefill(&req.prompt)?;
+            let pages = prefill
+                .inserted_pages
+                .as_ref()
+                .or(prefill.cached_pages.as_ref())
+                .ok_or_else(|| {
+                    EngineError::Speculative(crate::speculative::SpeculativeError::Model(
+                        "Failed to resolve pages for prefill".to_string(),
+                    ))
+                })?;
 
-        self.slot_pool.release(slot_id);
+            let page_ids: Vec<u32> = pages.pages.iter().map(|p| p.0 as u32).collect();
+            self.runtime.bind_slot(slot_id, &page_ids)?;
 
-        let mut full_sequence = Vec::with_capacity(prompt.len() + decoded.tokens.len());
-        full_sequence.extend_from_slice(prompt);
-        full_sequence.extend_from_slice(&decoded.tokens);
+            let session = self.decoder.begin(&req.prompt)?;
 
-        let inserted_handle = (!full_sequence.is_empty()).then(|| -> Result<_, EngineError> {
-            self.cache_sequence(&full_sequence)
-        }).transpose()?;
+            active.push(ActiveRequest {
+                session,
+                slot_id,
+                max_new_tokens: req.max_new_tokens,
+                generated: Vec::new(),
+                prefill,
+            });
+        }
 
-        let cached_pages = prefill
-            .cached_prefix
-            .handle
-            .and_then(|handle| self.runtime.allocator().materialize_span(handle));
+        // Bind prefix caches before starting
+        for req in &mut active {
+            draft_model.bind_slot(req.slot_id)?;
+            target_model.bind_slot(req.slot_id)?;
+            draft_model.bind_prefix_cache(&req.prefill.cached_prefix)?;
+            target_model.bind_prefix_cache(&req.prefill.cached_prefix)?;
+        }
 
-        Ok(EngineOutput {
-            tokens: decoded.tokens,
-            cached_prefix: prefill.cached_prefix,
-            cached_pages,
-            inserted_handle,
-            inserted_pages: inserted_handle
-                .and_then(|handle| self.runtime.allocator().materialize_span(handle)),
-            stats: EngineStats {
-                cache_hit_tokens: prefill.stats.cache_hit_tokens,
-                cache_miss_tokens: prefill.stats.cache_miss_tokens,
-                speculative: decoded.stats,
-            },
-        })
+        while active.iter().any(|req| req.generated.len() < req.max_new_tokens) {
+            let active_indices: Vec<usize> = active
+                .iter()
+                .enumerate()
+                .filter(|(_, req)| req.generated.len() < req.max_new_tokens)
+                .map(|(i, _)| i)
+                .collect();
+
+            if active_indices.is_empty() {
+                break;
+            }
+
+            // 1. Prepare and execute Draft Batch
+            let draft_results = {
+                let draft_reqs: Vec<(&[TokenId], usize)> = active_indices
+                    .iter()
+                    .map(|&idx| {
+                        let req = &active[idx];
+                        let remaining = req.max_new_tokens - req.generated.len();
+                        let requested = remaining.min(self.decoder.draft_window());
+                        (req.session.context(), requested)
+                    })
+                    .collect();
+
+                draft_model.draft_batch(&draft_reqs)?
+            };
+
+            for &idx in &active_indices {
+                active[idx].session.record_draft_call();
+            }
+
+            // 2. Prepare and execute Verify Batch
+            let mut drafted_tokens_storage = Vec::with_capacity(active_indices.len());
+            for i in 0..active_indices.len() {
+                let drafted_tokens: Vec<TokenId> =
+                    draft_results[i].iter().map(|p| p.token).collect();
+                drafted_tokens_storage.push(drafted_tokens);
+            }
+
+            let verify_results = {
+                let verify_reqs: Vec<(&[TokenId], &[TokenId])> = active_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &idx)| {
+                        (active[idx].session.context(), drafted_tokens_storage[i].as_slice())
+                    })
+                    .collect();
+
+                target_model.verify_batch(&verify_reqs)?
+            };
+
+            for &idx in &active_indices {
+                active[idx].session.record_target_call();
+            }
+
+            // 3. Commit results
+            for (i, &idx) in active_indices.iter().enumerate() {
+                let req = &mut active[idx];
+                let accepted = req.session.commit(&draft_results[i], &verify_results[i])?;
+                req.generated.extend_from_slice(&accepted);
+
+                if req.session.has_pending_rejection() {
+                    if let Some(token) = req.session.take_rejected_token() {
+                        req.generated.push(token);
+                    }
+                }
+            }
+        }
+
+        let mut final_outputs = Vec::with_capacity(active.len());
+        for req in active {
+            self.slot_pool.release(req.slot_id);
+
+            let mut full_sequence = Vec::with_capacity(req.session.prompt().len() + req.generated.len());
+            full_sequence.extend_from_slice(req.session.prompt());
+            full_sequence.extend_from_slice(&req.generated);
+
+            let inserted_handle = if !full_sequence.is_empty() {
+                Some(self.cache_sequence(&full_sequence)?)
+            } else {
+                None
+            };
+
+            final_outputs.push(EngineOutput {
+                tokens: req.generated,
+                cached_prefix: req.prefill.cached_prefix,
+                cached_pages: req.prefill.cached_pages,
+                inserted_handle,
+                inserted_pages: inserted_handle
+                    .and_then(|handle| self.runtime.allocator().materialize_span(handle)),
+                stats: EngineStats {
+                    cache_hit_tokens: req.prefill.stats.cache_hit_tokens,
+                    cache_miss_tokens: req.prefill.stats.cache_miss_tokens,
+                    speculative: req.session.stats().clone(),
+                },
+            });
+        }
+
+        Ok(final_outputs)
     }
 
     pub fn prefill(&mut self, prompt: &[TokenId]) -> Result<EnginePrefillOutput, EngineError> {
@@ -543,5 +683,165 @@ mod tests {
         let _ = engine.generate(&mut draft, &mut target, &[1], 2).unwrap();
         
         assert_eq!(draft.bound_slots.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_request_batching() {
+        let config = EngineConfig {
+            draft_window: 2,
+            memory: MemoryRuntimeConfig::cpu(1024, 16, 32, 4, 4), // 4 slots
+        };
+        let mut engine = VeloEngine::new(config).unwrap();
+
+        // Req 1: generates [2, 3]
+        // Req 2: generates [11, 12, 13]
+        let mut draft = ScriptedDraft {
+            script: vec![0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 11, 12, 13],
+            bound_prefixes: Vec::new(),
+            bound_slots: Vec::new(),
+        };
+
+        let mut target = ScriptedTarget {
+            script: vec![0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 11, 12, 13],
+            bound_prefixes: Vec::new(),
+            bound_slots: Vec::new(),
+        };
+
+        let requests = vec![
+            BatchRequest {
+                prompt: vec![1],
+                max_new_tokens: 2,
+            },
+            BatchRequest {
+                prompt: vec![10; 11],
+                max_new_tokens: 3,
+            },
+        ];
+
+        let outputs = engine.generate_batch(&mut draft, &mut target, requests).unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].tokens, vec![2, 3]);
+        assert_eq!(outputs[1].tokens, vec![11, 12, 13]);
+
+        // Verify isolation: both slots were used
+        assert_eq!(draft.bound_slots.len(), 2);
+        assert_ne!(draft.bound_slots[0], draft.bound_slots[1]);
+    }
+
+    #[test]
+    fn test_batch_with_mixed_finishing() {
+        let config = EngineConfig {
+            draft_window: 1,
+            memory: MemoryRuntimeConfig::cpu(1024, 16, 32, 4, 4),
+        };
+        let mut engine = VeloEngine::new(config).unwrap();
+
+        // Req 1: generates [2] (stops at max_tokens=1)
+        // Req 2: generates [11, 12] (stops at max_tokens=2)
+        let mut draft = ScriptedDraft {
+            script: vec![0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 12],
+            bound_prefixes: Vec::new(),
+            bound_slots: Vec::new(),
+        };
+        let mut target = ScriptedTarget {
+            script: vec![0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 12],
+            bound_prefixes: Vec::new(),
+            bound_slots: Vec::new(),
+        };
+
+        let requests = vec![
+            BatchRequest {
+                prompt: vec![1],
+                max_new_tokens: 1,
+            },
+            BatchRequest {
+                prompt: vec![10; 11],
+                max_new_tokens: 2,
+            },
+        ];
+
+        let outputs = engine.generate_batch(&mut draft, &mut target, requests).unwrap();
+
+        assert_eq!(outputs[0].tokens, vec![2]);
+        assert_eq!(outputs[1].tokens, vec![11, 12]);
+    }
+
+    #[test]
+    fn test_batch_slot_exhaustion() {
+        let config = EngineConfig {
+            draft_window: 1,
+            memory: MemoryRuntimeConfig::cpu(1024, 16, 32, 1, 1), // Only 1 slot
+        };
+        let mut engine = VeloEngine::new(config).unwrap();
+        let mut draft = ScriptedDraft {
+            script: vec![1, 2],
+            bound_prefixes: Vec::new(),
+            bound_slots: Vec::new(),
+        };
+        let mut target = ScriptedTarget {
+            script: vec![1, 2],
+            bound_prefixes: Vec::new(),
+            bound_slots: Vec::new(),
+        };
+
+        let requests = vec![
+            BatchRequest {
+                prompt: vec![0],
+                max_new_tokens: 1,
+            },
+            BatchRequest {
+                prompt: vec![0],
+                max_new_tokens: 1,
+            },
+        ];
+
+        let result = engine.generate_batch(&mut draft, &mut target, requests);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn engine_error_display() {
+        assert!(format!("{}", EngineError::Speculative(SpeculativeError::EmptyDraftWindow)).contains("speculative decoding failed"));
+        assert!(format!("{}", EngineError::KvStore(KvStoreError::EmptyBlock)).contains("KV store failed"));
+        assert!(format!("{}", EngineError::PagedAttention(PageManagerError::InvalidBlockSize)).contains("paged attention failed"));
+    }
+
+    #[test]
+    fn engine_accessors_and_stats() {
+        let mut engine = VeloEngine::new(EngineConfig {
+            draft_window: 1,
+            memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+        }).unwrap();
+        
+        assert_eq!(engine.cache().len(), 0);
+        assert_eq!(engine.cache_mut().len(), 0);
+        
+        let stats = EngineStats::default();
+        assert_eq!(stats.cache_hit_tokens, 0);
+    }
+
+    #[test]
+    fn prefill_empty_prompt() {
+        let mut engine = VeloEngine::new(EngineConfig {
+            draft_window: 1,
+            memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+        }).unwrap();
+        let prefill = engine.prefill(&[]).unwrap();
+        assert_eq!(prefill.stats.cache_hit_tokens, 0);
+        assert!(prefill.inserted_handle.is_none());
+    }
+
+    #[test]
+    fn generate_batch_with_prompt() {
+        let mut engine = VeloEngine::new(EngineConfig {
+            draft_window: 1,
+            memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+        }).unwrap();
+        let mut draft = ScriptedDraft { script: vec![1, 2], bound_prefixes: vec![], bound_slots: vec![] };
+        let mut target = ScriptedTarget { script: vec![1, 2], bound_prefixes: vec![], bound_slots: vec![] };
+        
+        let outputs = engine.generate(&mut draft, &mut target, &[1], 1).unwrap();
+        assert_eq!(outputs.tokens.len(), 1);
     }
 }
