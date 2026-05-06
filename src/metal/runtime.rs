@@ -22,6 +22,9 @@ pub struct MetalRuntimeHandles {
     pub library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
 }
 
+unsafe impl Send for MetalRuntimeHandles {}
+unsafe impl Sync for MetalRuntimeHandles {}
+
 impl Clone for MetalRuntimeHandles {
     fn clone(&self) -> Self {
         Self {
@@ -39,6 +42,9 @@ pub struct MetalRuntimeContext {
     pub placement: MetalBufferPlacement,
     pub handles: MetalRuntimeHandles,
 }
+
+unsafe impl Send for MetalRuntimeContext {}
+unsafe impl Sync for MetalRuntimeContext {}
 
 #[derive(Clone)]
 pub struct SharedPagedAttentionBlockManager(pub Arc<Mutex<PagedAttentionBlockManager>>);
@@ -72,7 +78,12 @@ pub struct MetalMemoryRuntime {
     pub slot_mapping: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
+unsafe impl Send for MetalMemoryRuntime {}
+unsafe impl Sync for MetalMemoryRuntime {}
+
 impl MetalMemoryRuntime {
+    /// Creates a new MetalMemoryRuntime from the provided configuration.
+    /// This initializes the Metal device, command queue, and shader library.
     pub fn new(config: MetalRuntimeConfig) -> Result<Self> {
         if config.model_name.trim().is_empty() {
             return Err(SpeculativeError::Model(
@@ -134,7 +145,7 @@ impl MetalMemoryRuntime {
             config.memory.paged_block_size,
             config.memory.n_layer,
         ))));
-        
+       
         let allocator = SharedPagedAttentionBlockManager(Arc::new(Mutex::new(PagedAttentionBlockManager::new(
             PagedAttentionConfig::new(
                 config.memory.paged_block_size,
@@ -183,6 +194,7 @@ impl MetalMemoryRuntime {
         self.bound_prefix = Some(prefix.clone());
     }
 
+    /// Injects specific Metal hardware handles into the runtime context.
     pub fn with_handles(mut self, handles: MetalRuntimeHandles) -> Self {
         self.context.handles = handles;
         self
@@ -229,7 +241,7 @@ impl MemoryRuntime for MetalMemoryRuntime {
         unsafe {
             let slot_ptr = contents.add(slot.0 as usize * max_pages);
             std::ptr::copy_nonoverlapping(pages.as_ptr(), slot_ptr, pages.len());
-            
+           
             if pages.len() < max_pages {
                 std::ptr::write_bytes(
                     slot_ptr.add(pages.len()),
@@ -238,7 +250,32 @@ impl MemoryRuntime for MetalMemoryRuntime {
                 );
             }
         }
-        
+       
         Ok(())
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::config::MetalRuntimeConfig;
+
+    #[test]
+    fn test_runtime_validation() {
+        let mut cfg = MetalRuntimeConfig::default();
+        cfg.model_name = "".into();
+        assert!(MetalMemoryRuntime::new(cfg).is_err());
+
+        let mut cfg = MetalRuntimeConfig::default();
+        cfg.model_name = "test".into();
+        cfg.memory.bytes_per_token = 0;
+        assert!(MetalMemoryRuntime::new(cfg).is_err());
+
+        let mut cfg = MetalRuntimeConfig::default();
+        cfg.model_name = "test".into();
+        cfg.memory.paged_block_size = 0;
+        assert!(MetalMemoryRuntime::new(cfg).is_err());
     }
 }

@@ -147,7 +147,7 @@ mod tests {
         let mut store = InMemoryKvStore::new(64);
         let h = KvCacheHandle { block_id: 99, token_len: 1 };
         assert!(matches!(store.release(h), Err(KvStoreError::UnknownBlock(_))));
-        
+       
         let h_real = store.allocate(1).unwrap();
         let h_fake = KvCacheHandle { block_id: h_real.block_id, token_len: 99 };
         assert!(matches!(store.release(h_fake), Err(KvStoreError::UnknownBlock(_))));
@@ -159,7 +159,7 @@ mod tests {
         let h = KvCacheHandle { block_id: 1, token_len: 1 };
         assert!(format!("{}", KvStoreError::EmptyBlock).contains("at least one token"));
         assert!(format!("{}", KvStoreError::UnknownBlock(h)).contains("unknown KV block 1"));
-        
+       
         let block = KvBlock { handle: h, bytes: 128 };
         let block2 = block.clone();
         assert_eq!(block, block2);

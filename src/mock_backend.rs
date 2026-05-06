@@ -119,12 +119,12 @@ mod tests {
     fn mock_backend_errors_and_meta() {
         let mut backend = MockBackend::new(vec![1, 2]);
         assert!(backend.token_at(5).is_err());
-        
+       
         backend.bind_prefix_cache(&CacheLookup { matched_tokens: 1, handle: None }).unwrap();
         assert_eq!(backend.bound_prefixes().len(), 1);
-        
+       
         backend.bind_slot(crate::slot_manager::SlotId(0)).unwrap();
-        
+       
         let backend2 = backend.clone();
         assert_eq!(backend2.script, vec![1, 2]);
         assert!(format!("{:?}", backend).contains("MockBackend"));

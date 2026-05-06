@@ -36,7 +36,7 @@ pub trait MemoryRuntime {
 }
 
 /// Configuration for the memory runtime and KV-cache layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MemoryRuntimeConfig {
     /// Number of bytes required per KV token (total across all heads).
     pub bytes_per_token: usize,
@@ -164,12 +164,12 @@ mod tests {
     fn runtime_accessors() {
         let config = MemoryRuntimeConfig::cpu(64, 16, 32, 1, 32);
         let mut rt = CpuMemoryRuntime::new(config).unwrap();
-        
+       
         assert_eq!(rt.store().allocated_bytes(), 0);
         assert_eq!(rt.store_mut().allocated_bytes(), 0);
         assert_eq!(rt.allocator().free_pages(), 32);
         assert_eq!(rt.allocator_mut().free_pages(), 32);
-        
+       
         rt.bind_slot(crate::slot_manager::SlotId(0), &[]).unwrap();
         assert!(format!("{:?}", rt).contains("CpuMemoryRuntime"));
     }
@@ -179,7 +179,7 @@ mod tests {
         let config = MemoryRuntimeConfig::cpu(64, 0, 32, 1, 32); // block_size 0 is invalid
         assert!(CpuMemoryRuntime::new(config).is_err());
     }
-    
+   
     #[test]
     fn trait_materialize() {
         let config = MemoryRuntimeConfig::cpu(64, 16, 32, 1, 32);

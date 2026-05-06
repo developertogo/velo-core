@@ -252,7 +252,7 @@ mod tests {
         let span2 = span.clone();
         assert_eq!(span, span2);
         assert!(format!("{:?}", span).contains("PageId"));
-        
+       
         let mapping = BlockMapping {
             handle: KvCacheHandle { block_id: 1, token_len: 1 },
             pages: vec![PageId(1)],

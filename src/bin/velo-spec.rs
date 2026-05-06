@@ -39,7 +39,7 @@ fn run(args: &[String]) -> Result<(), String> {
     eprintln!("Loading target model: {}", target_path.display());
     let t0 = Instant::now();
     let target_weights = load_gguf(target_path).map_err(|e| format!("Failed to load target model: {e}"))?;
-    
+   
     eprintln!("Loading draft model: {}", draft_path.display());
     let draft_weights = load_gguf(draft_path).map_err(|e| format!("Failed to load draft model: {e}"))?;
 
@@ -81,7 +81,7 @@ fn run(args: &[String]) -> Result<(), String> {
         paged_block_size: 16,
         quantization: draft_weights.meta.quantization,
     }).map_err(|e| format!("Failed to create draft backend: {e}"))?;
-    
+   
     // For simplicity, we reuse the target runtime's context if they are both unified
     draft_backend.wire(draft_weights, &target_runtime).map_err(|e| format!("Failed to wire draft: {e}"))?;
 

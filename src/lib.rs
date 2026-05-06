@@ -13,6 +13,8 @@ pub mod radix_cache;
 pub mod runtime;
 pub mod slot_manager;
 pub mod speculative;
+pub mod scheduler;
+pub mod tokenizer;
 
 pub use benchmark::{
     compare_with_llama_csv, load_llama_csv, parse_llama_csv, BenchmarkConfig, BenchmarkFormat,
@@ -42,6 +44,7 @@ pub use speculative::{
     DraftModel, NextTokenPrediction, SpeculativeDecoder, SpeculativeError, SpeculativeOutput,
     SpeculativeStats, TargetModel, VerifyStep, Result,
 };
+pub use scheduler::VeloScheduler;
 pub use gguf::{GgmlType, GgufError, GgufFile, GgufValue, TensorInfo};
 pub use model_loader::{load_gguf, LoadError, ModelMeta, WeightStore};
 pub use quant::{dequant_matrix, dequant_row};

@@ -199,14 +199,14 @@ impl WeightStore {
         };
 
         check("token_embd.weight", &[n_embd, n_vocab])?;
-        
+       
         for l in 0..n_layer {
             check(&format!("layers.{}.attention_norm.weight", l), &[n_embd])?;
             check(&format!("layers.{}.attention.wq.weight", l), &[n_embd, n_embd])?;
             check(&format!("layers.{}.attention.wk.weight", l), &[n_embd, n_head_kv * head_dim])?;
             check(&format!("layers.{}.attention.wv.weight", l), &[n_embd, n_head_kv * head_dim])?;
             check(&format!("layers.{}.attention.wo.weight", l), &[n_embd, n_embd])?;
-            
+           
             check(&format!("layers.{}.ffn_norm.weight", l), &[n_embd])?;
             check(&format!("layers.{}.feed_forward.w1.weight", l), &[n_embd, n_ff])?;
             check(&format!("layers.{}.feed_forward.w2.weight", l), &[n_ff, n_embd])?;
@@ -235,7 +235,7 @@ impl WeightStore {
         };
         let mut index = HashMap::new();
         let mut data = Vec::new();
-        
+       
         let mut add = |name: &str, shape: Vec<u64>| {
             let n_elems: u64 = shape.iter().product();
             let nbytes = n_elems * 4;
@@ -419,7 +419,7 @@ mod tests {
         let mut m = llama_meta_map();
         m.insert("llama.block_count".into(), GgufValue::U32(1)); // 1 layer only
         let meta = ModelMeta::from_gguf(&fake_gguf(m)).unwrap();
-        
+       
         let mut tensors = HashMap::new();
         // Missing almost all tensors, but let's just add one with wrong shape
         tensors.insert("token_embd.weight".to_string(), TensorInfo {
@@ -435,7 +435,7 @@ mod tests {
             index: tensors,
             data: vec![0, 0, 0, 0],
         };
-        
+       
         let err = store.validate().unwrap_err();
         assert!(err.to_string().contains("expected shape"));
     }
@@ -457,7 +457,7 @@ mod tests {
         });
         let gguf = GgufFile { version: 3, metadata: HashMap::new(), tensors, data_offset: 0 };
         assert_eq!(infer_quantization(&gguf), Quantization::Q4K);
-        
+       
         let mut tensors = HashMap::new();
         tensors.insert("token_embd.weight".to_string(), TensorInfo {
             name: "".into(), shape: vec![], dtype: GgmlType::Q4_0, offset: 0, nbytes: 0,
@@ -479,7 +479,7 @@ mod tests {
         m.remove("llama.vocab_size"); // Also remove fallback
         let gguf = fake_gguf(m);
         assert!(matches!(ModelMeta::from_gguf(&gguf), Err(LoadError::MissingMeta(k)) if k == "vocab_size"));
-        
+       
         let mut m = llama_meta_map();
         m.remove("llama.attention.head_count");
         let gguf = fake_gguf(m);
@@ -500,7 +500,7 @@ mod tests {
         m.insert("llama.attention.head_count".into(), GgufValue::U32(1));
         m.insert("llama.feed_forward_length".into(), GgufValue::U32(512));
         m.insert("llama.vocab_size".into(), GgufValue::U32(100)); // fallback
-        
+       
         let gguf = fake_gguf(m);
         let meta = ModelMeta::from_gguf(&gguf).unwrap();
         assert_eq!(meta.arch, "llama"); // default

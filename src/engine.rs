@@ -5,7 +5,7 @@ use crate::runtime::{
     CpuMemoryRuntime, KvBlockStore, MemoryRuntime, MemoryRuntimeConfig, PagedBlockAllocator,
 };
 use crate::speculative::{
-    DraftModel, SpeculativeDecoder, SpeculativeError, SpeculativeStats, TargetModel,
+    SpeculativeDecoder, SpeculativeError, SpeculativeStats,
 };
 
 /// High-performance inference engine for speculative decoding.
@@ -110,6 +110,18 @@ where
 
     pub fn decoder(&self) -> &SpeculativeDecoder {
         &self.decoder
+    }
+
+    pub fn slot_pool_capacity(&self) -> usize {
+        self.slot_pool.capacity()
+    }
+
+    pub fn allocate_slot(&mut self) -> Option<crate::slot_manager::SlotId> {
+        self.slot_pool.alloc()
+    }
+
+    pub fn release_slot(&mut self, slot_id: crate::slot_manager::SlotId) {
+        self.slot_pool.release(slot_id);
     }
 
     pub fn generate<D, T>(
@@ -391,7 +403,9 @@ mod tests {
     use crate::kv_store::KvStore;
     use crate::metal::Quantization;
     use crate::{MetalMemoryRuntime, MetalRuntimeConfig};
-    use crate::speculative::{NextTokenPrediction, Result as SpeculativeResult, VerifyStep};
+    use crate::speculative::{
+        DraftModel, NextTokenPrediction, Result as SpeculativeResult, TargetModel, VerifyStep,
+    };
 
     #[derive(Debug)]
     struct ScriptedDraft {
@@ -678,10 +692,10 @@ mod tests {
 
         // First one works
         let _ = engine.generate(&mut draft, &mut target, &[1], 2).unwrap();
-        
+       
         // Second one also works because the slot was released
         let _ = engine.generate(&mut draft, &mut target, &[1], 2).unwrap();
-        
+       
         assert_eq!(draft.bound_slots.len(), 2);
     }
 
@@ -813,10 +827,10 @@ mod tests {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
         }).unwrap();
-        
+       
         assert_eq!(engine.cache().len(), 0);
         assert_eq!(engine.cache_mut().len(), 0);
-        
+       
         let stats = EngineStats::default();
         assert_eq!(stats.cache_hit_tokens, 0);
     }
@@ -840,7 +854,7 @@ mod tests {
         }).unwrap();
         let mut draft = ScriptedDraft { script: vec![1, 2], bound_prefixes: vec![], bound_slots: vec![] };
         let mut target = ScriptedTarget { script: vec![1, 2], bound_prefixes: vec![], bound_slots: vec![] };
-        
+       
         let outputs = engine.generate(&mut draft, &mut target, &[1], 1).unwrap();
         assert_eq!(outputs.tokens.len(), 1);
     }

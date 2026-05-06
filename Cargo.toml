@@ -21,6 +21,11 @@ path = "src/bin/velo-run.rs"
 name = "velo-spec"
 path = "src/bin/velo-spec.rs"
 
+[[bin]]
+name = "velo-serve"
+path = "src/bin/velo-serve.rs"
+required-features = ["serve"]
+
 [[bench]]
 name = "smoke_bench"
 path = "benches/smoke_bench.rs"
@@ -30,4 +35,18 @@ harness = false
 objc2-metal = "0.3.2"
 objc2-foundation = "0.3.2"
 objc2 = "0.6.4"
+tokio = { version = "1.52.2", features = ["full"] }
+serde = { version = "1.0.228", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
+anyhow = "1.0.102"
+futures = "0.3.32"
 
+# Optional web dependencies
+axum = { version = "0.8.9", optional = true }
+serde_json = { version = "1.0.149", optional = true }
+tower-http = { version = "0.6.8", features = ["cors", "fs", "trace"], optional = true }
+async-stream = { version = "0.3.6", optional = true }
+
+[features]
+default = ["serve"]
+serve = ["dep:axum", "dep:serde_json", "dep:tower-http", "dep:async-stream"]

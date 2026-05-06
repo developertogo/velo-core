@@ -577,10 +577,10 @@ mod tests {
         assert_eq!(GgufValue::I32(42).as_i32(), Some(42));
         assert_eq!(GgufValue::F32(4.2).as_f32(), Some(4.2));
         assert_eq!(GgufValue::String("hi".to_string()).as_str(), Some("hi"));
-        
+       
         let arr = GgufValue::Array(vec![GgufValue::U32(1)]);
         assert!(arr.as_array().is_some());
-        
+       
         // Negative cases
         assert!(GgufValue::U8(1).as_u32().is_none());
         assert!(GgufValue::U8(1).as_u64().is_none());
@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(GgufValue::I64(1).as_i64(), Some(1));
         assert_eq!(GgufValue::F64(1.0).as_f64(), Some(1.0));
         assert_eq!(GgufValue::Bool(true).as_bool(), Some(true));
-        
+       
         assert!(GgufValue::U8(1).as_i8().is_none());
         assert!(GgufValue::U8(1).as_u16().is_none());
         assert!(GgufValue::U8(1).as_i16().is_none());
@@ -614,7 +614,7 @@ mod tests {
         data.extend_from_slice(&3u32.to_le_bytes());
         data.extend_from_slice(&0u64.to_le_bytes()); // tensor count
         data.extend_from_slice(&0u64.to_le_bytes()); // kv count
-        
+       
         let mut cursor = std::io::Cursor::new(data);
         let res = GgufFile::read(&mut cursor);
         assert!(res.is_ok());
@@ -639,7 +639,7 @@ mod tests {
         b[8..16].copy_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
         write_str(&mut b, "test_tensor");
         write_u32(&mut b, 5); // 5 dims (too many)
-        
+       
         assert!(matches!(
             GgufFile::read(&mut Cursor::new(&b)),
             Err(GgufError::Malformed(_))
@@ -654,7 +654,7 @@ mod tests {
         write_u32(&mut b, 1); // 1 dim
         write_u64(&mut b, 10); // size 10
         write_u32(&mut b, 999); // unknown type
-        
+       
         assert!(matches!(
             GgufFile::read(&mut Cursor::new(&b)),
             Err(GgufError::UnknownType(999))
@@ -668,7 +668,7 @@ mod tests {
         write_u32(&mut b, 3);
         write_u64(&mut b, 0);
         write_u64(&mut b, 12); // 12 kvs
-        
+       
         let mut add = |key: &str, type_id: u32, write_fn: &dyn Fn(&mut Vec<u8>)| {
             write_str(&mut b, key);
             write_u32(&mut b, type_id);
@@ -716,24 +716,24 @@ mod tests {
         write_u32(&mut b, 3);
         write_u64(&mut b, 1); // 1 tensor
         write_u64(&mut b, 1); // 1 kv
-        
+       
         // KV: alignment = 64
         write_str(&mut b, "general.alignment");
         write_u32(&mut b, 10); // U64
         write_u64(&mut b, 64);
-        
+       
         // Tensor info
         write_str(&mut b, "test_tensor");
         write_u32(&mut b, 1); // 1 dim
         write_u64(&mut b, 4); // 4 elements
         write_u32(&mut b, 0); // F32
         write_u64(&mut b, 0); // offset 0
-        
+       
         // Current position in b is the header end
         let header_len = b.len() as u64;
         let alignment = 64u64;
         let data_start = header_len.div_ceil(alignment) * alignment;
-        
+       
         // Pad b to data_start
         b.resize(data_start as usize, 0);
         // Add tensor data: 4 * f32 = 16 bytes
@@ -745,13 +745,13 @@ mod tests {
         let mut cursor = Cursor::new(&b);
         let file = GgufFile::read(&mut cursor).unwrap();
         assert_eq!(file.data_offset, data_start);
-        
+       
         let read_data = file.read_tensor(&mut cursor, "test_tensor").unwrap();
         assert_eq!(read_data.len(), 16);
-        
+       
         let all_data = file.read_all_tensors(&mut cursor).unwrap();
         assert_eq!(all_data.len(), 16);
-        
+       
         assert!(file.read_tensor(&mut cursor, "nonexistent").is_err());
     }
 

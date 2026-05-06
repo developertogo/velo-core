@@ -341,13 +341,13 @@ mod tests {
     fn rejects_invalid_values() {
         let mut args = vec!["velo-bench".to_string(), "--prompt-len".to_string(), "abc".to_string()];
         assert!(CliArgs::parse(args.clone().into_iter().skip(1)).is_err());
-        
+       
         args = vec!["velo-bench".to_string(), "--format".to_string(), "unknown".to_string()];
         assert!(CliArgs::parse(args.clone().into_iter().skip(1)).is_err());
-        
+       
         args = vec!["velo-bench".to_string(), "--quantization".to_string(), "unknown".to_string()];
         assert!(CliArgs::parse(args.clone().into_iter().skip(1)).is_err());
-        
+       
         args = vec!["velo-bench".to_string(), "--unknown".to_string()];
         assert!(CliArgs::parse(args.clone().into_iter().skip(1)).is_err());
     }

@@ -156,12 +156,7 @@ pub fn run_single_case(
     let (elapsed_ns, ttft_ns, output, prefill) = match config.mode {
         BenchmarkMode::PromptProcessing => {
             let prefill = engine.prefill(&prompt)?;
-            (
-                started.elapsed().as_nanos(),
-                None,
-                None,
-                Some(prefill),
-            )
+            (started.elapsed().as_nanos(), None, None, Some(prefill))
         }
         BenchmarkMode::Generation | BenchmarkMode::PromptPlusGeneration => {
             let mut draft = GreedyDraftModel::new(MockBackend::new(script.clone()));
@@ -286,7 +281,10 @@ where
 }
 
 fn summarize(config: &BenchmarkConfig, samples: &[BenchmarkSample]) -> BenchmarkRow {
-    let elapsed_ns = samples.iter().map(|sample| sample.elapsed_ns as f64).collect::<Vec<_>>();
+    let elapsed_ns = samples
+        .iter()
+        .map(|sample| sample.elapsed_ns as f64)
+        .collect::<Vec<_>>();
     let tokens_per_second = samples
         .iter()
         .map(|sample| 1e9 * sample.tokens as f64 / sample.elapsed_ns as f64)
@@ -296,7 +294,12 @@ fn summarize(config: &BenchmarkConfig, samples: &[BenchmarkSample]) -> Benchmark
         .filter_map(|sample| sample.ttft_ns.map(|value| value as f64))
         .collect::<Vec<_>>();
 
-    let mode_label = format_mode(config.mode, config.prompt_len, config.gen_len, config.cached_depth);
+    let mode_label = format_mode(
+        config.mode,
+        config.prompt_len,
+        config.gen_len,
+        config.cached_depth,
+    );
     BenchmarkRow {
         model_name: config.model_name.clone(),
         backend_name: config.backend_name.clone(),
@@ -312,18 +315,53 @@ fn summarize(config: &BenchmarkConfig, samples: &[BenchmarkSample]) -> Benchmark
         avg_ts: mean(&tokens_per_second),
         stddev_ts: stddev(&tokens_per_second),
         avg_ttft_ns: (!ttft.is_empty()).then(|| mean(&ttft)),
-        avg_cache_hit_tokens: mean(&samples.iter().map(|s| s.cache_hit_tokens as f64).collect::<Vec<_>>()),
-        avg_cache_miss_tokens: mean(&samples.iter().map(|s| s.cache_miss_tokens as f64).collect::<Vec<_>>()),
-        avg_draft_calls: mean(&samples.iter().map(|s| s.speculative.draft_calls as f64).collect::<Vec<_>>()),
-        avg_target_calls: mean(&samples.iter().map(|s| s.speculative.target_calls as f64).collect::<Vec<_>>()),
-        avg_accepted_tokens: mean(&samples.iter().map(|s| s.speculative.accepted_tokens as f64).collect::<Vec<_>>()),
-        avg_rejected_tokens: mean(&samples.iter().map(|s| s.speculative.rejected_tokens as f64).collect::<Vec<_>>()),
+        avg_cache_hit_tokens: mean(
+            &samples
+                .iter()
+                .map(|s| s.cache_hit_tokens as f64)
+                .collect::<Vec<_>>(),
+        ),
+        avg_cache_miss_tokens: mean(
+            &samples
+                .iter()
+                .map(|s| s.cache_miss_tokens as f64)
+                .collect::<Vec<_>>(),
+        ),
+        avg_draft_calls: mean(
+            &samples
+                .iter()
+                .map(|s| s.speculative.draft_calls as f64)
+                .collect::<Vec<_>>(),
+        ),
+        avg_target_calls: mean(
+            &samples
+                .iter()
+                .map(|s| s.speculative.target_calls as f64)
+                .collect::<Vec<_>>(),
+        ),
+        avg_accepted_tokens: mean(
+            &samples
+                .iter()
+                .map(|s| s.speculative.accepted_tokens as f64)
+                .collect::<Vec<_>>(),
+        ),
+        avg_rejected_tokens: mean(
+            &samples
+                .iter()
+                .map(|s| s.speculative.rejected_tokens as f64)
+                .collect::<Vec<_>>(),
+        ),
         baseline_avg_ts: None,
         speedup_vs_baseline: None,
     }
 }
 
-fn format_mode(mode: BenchmarkMode, prompt_len: usize, gen_len: usize, cached_depth: usize) -> String {
+fn format_mode(
+    mode: BenchmarkMode,
+    prompt_len: usize,
+    gen_len: usize,
+    cached_depth: usize,
+) -> String {
     let mut test = match mode {
         BenchmarkMode::PromptProcessing => format!("pp{prompt_len}"),
         BenchmarkMode::Generation => format!("tg{gen_len}"),
@@ -337,7 +375,10 @@ fn format_mode(mode: BenchmarkMode, prompt_len: usize, gen_len: usize, cached_de
     test
 }
 
-pub fn compare_with_llama_csv(rows: &mut [BenchmarkRow], llama_csv: &str) -> Result<Vec<LlamaBenchRow>, String> {
+pub fn compare_with_llama_csv(
+    rows: &mut [BenchmarkRow],
+    llama_csv: &str,
+) -> Result<Vec<LlamaBenchRow>, String> {
     let baseline_rows = parse_llama_csv(llama_csv)?;
     let baseline_by_test = baseline_rows
         .iter()
@@ -480,7 +521,11 @@ fn stddev(values: &[f64]) -> f64 {
     }
 
     let mean = mean(values);
-    let variance = values.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
     variance.sqrt()
 }
 
@@ -507,7 +552,9 @@ impl std::fmt::Display for BenchmarkFormat {
 impl BenchmarkReport {
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str("| test | model | backend | t/s | ttft ns | cache hit | cache miss | speedup |\n");
+        out.push_str(
+            "| test | model | backend | t/s | ttft ns | cache hit | cache miss | speedup |\n",
+        );
         out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
         for row in &self.rows {
             let ttft = row
@@ -537,9 +584,15 @@ impl BenchmarkReport {
         let mut out = String::new();
         out.push_str("model_name,backend_name,test,mode,prompt_len,gen_len,cached_depth,repetitions,warmups,avg_ns,stddev_ns,avg_ts,stddev_ts,avg_ttft_ns,avg_cache_hit_tokens,avg_cache_miss_tokens,avg_draft_calls,avg_target_calls,avg_accepted_tokens,avg_rejected_tokens,baseline_avg_ts,speedup_vs_baseline\n");
         for row in &self.rows {
-            let ttft = row.avg_ttft_ns.map_or(String::new(), |value| value.to_string());
-            let baseline = row.baseline_avg_ts.map_or(String::new(), |value| value.to_string());
-            let speedup = row.speedup_vs_baseline.map_or(String::new(), |value| value.to_string());
+            let ttft = row
+                .avg_ttft_ns
+                .map_or(String::new(), |value| value.to_string());
+            let baseline = row
+                .baseline_avg_ts
+                .map_or(String::new(), |value| value.to_string());
+            let speedup = row
+                .speedup_vs_baseline
+                .map_or(String::new(), |value| value.to_string());
             out.push_str(&format!(
                 "{},{},{},{},{},{},{},{},{},{:.0},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{}\n",
                 row.model_name,
@@ -696,7 +749,10 @@ mod tests {
 
     #[test]
     fn formats_test_name_like_llama_bench() {
-        assert_eq!(format_mode(BenchmarkMode::PromptProcessing, 512, 0, 0), "pp512");
+        assert_eq!(
+            format_mode(BenchmarkMode::PromptProcessing, 512, 0, 0),
+            "pp512"
+        );
         assert_eq!(format_mode(BenchmarkMode::Generation, 0, 128, 0), "tg128");
         assert_eq!(
             format_mode(BenchmarkMode::PromptPlusGeneration, 512, 128, 64),
@@ -745,7 +801,7 @@ mod tests {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
         };
-        
+
         let config = BenchmarkConfig {
             mode: BenchmarkMode::PromptProcessing,
             prompt_len: 8,
@@ -761,7 +817,7 @@ mod tests {
             model_name: "test".into(),
             backend_name: "cpu".into(),
         };
-        
+
         let sample = run_single_case(&engine_config, &config).unwrap();
         assert_eq!(sample.tokens, 8);
         assert!(sample.elapsed_ns > 0);
@@ -770,12 +826,27 @@ mod tests {
     #[test]
     fn benchmark_row_tokens_processed() {
         let mut row = BenchmarkRow {
-            model_name: "".into(), backend_name: "".into(), test: "".into(),
-            mode: BenchmarkMode::PromptProcessing, prompt_len: 10, gen_len: 20,
-            cached_depth: 0, repetitions: 1, warmups: 0, avg_ns: 0.0, stddev_ns: 0.0,
-            avg_ts: 0.0, stddev_ts: 0.0, avg_ttft_ns: None, avg_cache_hit_tokens: 0.0,
-            avg_cache_miss_tokens: 0.0, avg_draft_calls: 0.0, avg_target_calls: 0.0,
-            avg_accepted_tokens: 0.0, avg_rejected_tokens: 0.0, baseline_avg_ts: None,
+            model_name: "".into(),
+            backend_name: "".into(),
+            test: "".into(),
+            mode: BenchmarkMode::PromptProcessing,
+            prompt_len: 10,
+            gen_len: 20,
+            cached_depth: 0,
+            repetitions: 1,
+            warmups: 0,
+            avg_ns: 0.0,
+            stddev_ns: 0.0,
+            avg_ts: 0.0,
+            stddev_ts: 0.0,
+            avg_ttft_ns: None,
+            avg_cache_hit_tokens: 0.0,
+            avg_cache_miss_tokens: 0.0,
+            avg_draft_calls: 0.0,
+            avg_target_calls: 0.0,
+            avg_accepted_tokens: 0.0,
+            avg_rejected_tokens: 0.0,
+            baseline_avg_ts: None,
             speedup_vs_baseline: None,
         };
         assert_eq!(row.tokens_processed(), 10);
@@ -788,12 +859,27 @@ mod tests {
     #[test]
     fn benchmark_report_csv_not_empty() {
         let row = BenchmarkRow {
-            model_name: "m".into(), backend_name: "b".into(), test: "t".into(),
-            mode: BenchmarkMode::Generation, prompt_len: 1, gen_len: 1,
-            cached_depth: 0, repetitions: 1, warmups: 0, avg_ns: 1000.0, stddev_ns: 0.0,
-            avg_ts: 1000.0, stddev_ts: 0.0, avg_ttft_ns: Some(500.0), avg_cache_hit_tokens: 0.0,
-            avg_cache_miss_tokens: 1.0, avg_draft_calls: 1.0, avg_target_calls: 1.0,
-            avg_accepted_tokens: 1.0, avg_rejected_tokens: 0.0, baseline_avg_ts: Some(800.0),
+            model_name: "m".into(),
+            backend_name: "b".into(),
+            test: "t".into(),
+            mode: BenchmarkMode::Generation,
+            prompt_len: 1,
+            gen_len: 1,
+            cached_depth: 0,
+            repetitions: 1,
+            warmups: 0,
+            avg_ns: 1000.0,
+            stddev_ns: 0.0,
+            avg_ts: 1000.0,
+            stddev_ts: 0.0,
+            avg_ttft_ns: Some(500.0),
+            avg_cache_hit_tokens: 0.0,
+            avg_cache_miss_tokens: 1.0,
+            avg_draft_calls: 1.0,
+            avg_target_calls: 1.0,
+            avg_accepted_tokens: 1.0,
+            avg_rejected_tokens: 0.0,
+            baseline_avg_ts: Some(800.0),
             speedup_vs_baseline: Some(1.25),
         };
         let report = BenchmarkReport { rows: vec![row] };
@@ -817,16 +903,26 @@ mod tests {
 
     #[test]
     fn benchmark_enum_displays() {
-        assert_eq!(format!("{}", BenchmarkMode::PromptProcessing), "prompt-processing");
+        assert_eq!(
+            format!("{}", BenchmarkMode::PromptProcessing),
+            "prompt-processing"
+        );
         assert_eq!(format!("{}", BenchmarkFormat::Json), "json");
     }
 
     #[test]
     fn llama_bench_row_display() {
         let row = LlamaBenchRow {
-            model_filename: "f".into(), backend: "b".into(), test: "t".into(),
-            n_prompt: 0, n_gen: 0, n_depth: 0, avg_ns: 0, stddev_ns: 0,
-            avg_ts: 10.0, stddev_ts: 0.0,
+            model_filename: "f".into(),
+            backend: "b".into(),
+            test: "t".into(),
+            n_prompt: 0,
+            n_gen: 0,
+            n_depth: 0,
+            avg_ns: 0,
+            stddev_ns: 0,
+            avg_ts: 10.0,
+            stddev_ts: 0.0,
         };
         assert!(format!("{}", row).contains("10.00 t/s"));
     }
@@ -863,7 +959,7 @@ mod tests {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
         };
-        
+
         let config = BenchmarkConfig {
             mode: BenchmarkMode::Generation,
             prompt_len: 4,
@@ -879,7 +975,7 @@ mod tests {
             model_name: "test".into(),
             backend_name: "cpu".into(),
         };
-        
+
         let sample = run_single_case(&engine_config, &config).unwrap();
         assert_eq!(sample.tokens, 4);
         assert!(sample.elapsed_ns > 0);
@@ -891,7 +987,7 @@ mod tests {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
         };
-        
+
         let config = BenchmarkConfig {
             mode: BenchmarkMode::PromptPlusGeneration,
             prompt_len: 4,
@@ -907,7 +1003,7 @@ mod tests {
             model_name: "test".into(),
             backend_name: "cpu".into(),
         };
-        
+
         let sample = run_single_case(&engine_config, &config).unwrap();
         assert_eq!(sample.tokens, 8);
         assert!(sample.elapsed_ns > 0);
@@ -919,13 +1015,16 @@ mod tests {
         assert_eq!(mean(&[]), 0.0);
         assert!(stddev(&[1.0, 2.0, 3.0]) > 0.0);
         assert_eq!(stddev(&[1.0]), 0.0);
-        
+
         assert_eq!(format_llama_test(512, 0, 0), "pp512");
         assert_eq!(format_llama_test(0, 128, 0), "tg128");
         assert_eq!(format_llama_test(512, 128, 0), "pp512+tg128");
         assert_eq!(format_llama_test(512, 0, 256), "pp512 @ d256");
-        
-        assert_eq!(format!("{}", BenchmarkMode::PromptProcessing), "prompt-processing");
+
+        assert_eq!(
+            format!("{}", BenchmarkMode::PromptProcessing),
+            "prompt-processing"
+        );
         assert_eq!(format!("{}", BenchmarkFormat::Json), "json");
     }
 

@@ -26,6 +26,9 @@ pub struct MetalKvStore {
     free_offsets: Vec<usize>,
 }
 
+unsafe impl Send for MetalKvStore {}
+unsafe impl Sync for MetalKvStore {}
+
 #[derive(Clone)]
 pub struct SharedMetalKvStore(pub Arc<Mutex<MetalKvStore>>);
 
@@ -39,7 +42,7 @@ impl MetalKvStore {
             .expect("Failed to allocate K pool buffer");
         let v_pool = device.newBufferWithLength_options(pool_size as _, options)
             .expect("Failed to allocate V pool buffer");
-        
+       
         let free_offsets = (0..pool_pages).map(|i| i * page_bytes).rev().collect();
 
         Self {
@@ -52,19 +55,23 @@ impl MetalKvStore {
         }
     }
 
+    /// Returns a reference to the K pool Metal buffer.
     pub fn k_pool(&self) -> &Retained<ProtocolObject<dyn MTLBuffer>> {
         &self.k_pool
     }
 
+    /// Returns a reference to the V pool Metal buffer.
     pub fn v_pool(&self) -> &Retained<ProtocolObject<dyn MTLBuffer>> {
         &self.v_pool
     }
 
+    /// Returns the total number of bytes currently allocated in the pools.
     pub fn allocated_bytes(&self) -> usize {
         if self.free_offsets.is_empty() && self.blocks.is_empty() { return 0; }
         self.blocks.len() * (self.k_pool.length() as usize / (self.free_offsets.len() + self.blocks.len())) * 2
     }
 
+    /// Allocates a new block from the pool for a given sequence length.
     pub fn allocate(
         &mut self,
         token_len: usize,
@@ -83,12 +90,14 @@ impl MetalKvStore {
         Ok(handle)
     }
 
+    /// Returns a reference to a block given its handle.
     pub fn get_block(&self, handle: KvCacheHandle) -> Option<&KvBlock> {
         self.blocks
             .get(&handle.block_id)
             .filter(|b| b.handle == handle)
     }
 
+    /// Releases a block back to the pool.
     pub fn release_block(&mut self, handle: KvCacheHandle) -> Result<(), KvStoreError> {
         let block = self.blocks.remove(&handle.block_id).ok_or(KvStoreError::UnknownBlock(handle))?;
         self.free_offsets.push(block.offset);

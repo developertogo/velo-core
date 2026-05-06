@@ -44,10 +44,10 @@ mod tests {
         let e1 = MetalError::DeviceNotFound;
         let e2 = MetalError::LibraryError("lib".into());
         let e3 = MetalError::PipelineError("pipe".into());
-        
+       
         assert_eq!(e1, e1.clone());
         assert_ne!(e1, e2);
-        
+       
         assert!(format!("{}", e1).contains("not found"));
         assert!(format!("{}", e2).contains("Metal library error: lib"));
         assert!(format!("{}", e3).contains("Metal pipeline error: pipe"));
