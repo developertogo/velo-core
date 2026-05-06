@@ -1,6 +1,9 @@
 use crate::radix_cache::TokenId;
 use crate::speculative::NextTokenPrediction;
 
+/// A mask of allowed tokens.
+pub type LogitMask = vob::Vob<usize>;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TokenLogit {
     token: TokenId,
@@ -22,16 +25,21 @@ impl Ord for TokenLogit {
 }
 
 pub trait Sampler {
-    fn sample(&self, logits: &[f32]) -> NextTokenPrediction;
+    fn sample(&self, logits: &[f32], mask: Option<&LogitMask>) -> NextTokenPrediction;
 }
 
 pub struct GreedySampler;
 
 impl Sampler for GreedySampler {
-    fn sample(&self, logits: &[f32]) -> NextTokenPrediction {
+    fn sample(&self, logits: &[f32], mask: Option<&LogitMask>) -> NextTokenPrediction {
         let mut max_logit = -f32::INFINITY;
         let mut max_token = 0;
         for (i, &logit) in logits.iter().enumerate() {
+            if let Some(mask) = mask {
+                if !mask.get(i).unwrap_or(false) {
+                    continue;
+                }
+            }
             if logit >= max_logit {
                 max_logit = logit;
                 max_token = i as TokenId;
@@ -50,20 +58,31 @@ pub struct TopPSampler {
 }
 
 impl Sampler for TopPSampler {
-    fn sample(&self, logits: &[f32]) -> NextTokenPrediction {
+    fn sample(&self, logits: &[f32], mask: Option<&LogitMask>) -> NextTokenPrediction {
         let temp = self.temperature.max(1e-6);
         if self.p >= 1.0 && self.temperature <= 0.0 {
-            return GreedySampler.sample(logits);
+            return GreedySampler.sample(logits, mask);
         }
 
         let mut token_logits: Vec<TokenLogit> = logits
             .iter()
             .enumerate()
+            .filter(|(i, _)| {
+                if let Some(mask) = mask {
+                    mask.get(*i).unwrap_or(false)
+                } else {
+                    true
+                }
+            })
             .map(|(i, &l)| TokenLogit {
                 token: i as TokenId,
                 logit: l / temp,
             })
             .collect();
+        
+        if token_logits.is_empty() {
+             return GreedySampler.sample(logits, None); // Fallback
+        }
 
         // Sort descending
         token_logits.sort_by(|a, b| b.logit.partial_cmp(&a.logit).unwrap());
@@ -112,16 +131,27 @@ pub struct MinPSampler {
 }
 
 impl Sampler for MinPSampler {
-    fn sample(&self, logits: &[f32]) -> NextTokenPrediction {
+    fn sample(&self, logits: &[f32], mask: Option<&LogitMask>) -> NextTokenPrediction {
         let temp = self.temperature.max(1e-6);
         let mut token_logits: Vec<TokenLogit> = logits
             .iter()
             .enumerate()
+            .filter(|(i, _)| {
+                if let Some(mask) = mask {
+                    mask.get(*i).unwrap_or(false)
+                } else {
+                    true
+                }
+            })
             .map(|(i, &l)| TokenLogit {
                 token: i as TokenId,
                 logit: l / temp,
             })
             .collect();
+
+        if token_logits.is_empty() {
+            return GreedySampler.sample(logits, None); // Fallback
+        }
 
         token_logits.sort_by(|a, b| b.logit.partial_cmp(&a.logit).unwrap());
 

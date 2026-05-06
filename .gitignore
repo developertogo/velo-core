@@ -31,3 +31,6 @@ skills-lock.json
 
 # test coverage
 /coverage_report/
+
+# scratch
+/scratch/

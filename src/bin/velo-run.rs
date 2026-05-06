@@ -58,7 +58,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let ttft = t1.elapsed();
 
     let sampler = GreedySampler;
-    let first_tok = sampler.sample(&prompt_logits);
+    let first_tok = sampler.sample(&prompt_logits, None);
 
     eprintln!(
         "TTFT: {:.1}ms  first token id: {} (confidence {:.4})",
@@ -75,7 +75,7 @@ fn run(args: &[String]) -> Result<(), String> {
     for _ in 0..max_new {
         let last = *generated.last().unwrap();
         let logits = model.next_logits(&[last]).map_err(|e| format!("Generation failed: {e}"))?;
-        let pred = sampler.sample(logits.values());
+        let pred = sampler.sample(logits.values(), None);
         generated.push(pred.token);
     }
     let gen_elapsed = t2.elapsed();
@@ -280,10 +280,10 @@ mod tests {
        
         let logits = model.forward_sequence(&prompt).unwrap();
         let sampler = GreedySampler;
-        let tok = sampler.sample(TokenLogits::new(logits).unwrap().values());
+        let tok = sampler.sample(TokenLogits::new(logits).unwrap().values(), None);
         
         let next_logits = model.next_logits(&[tok.token]).unwrap();
-        let next_tok = sampler.sample(next_logits.values());
+        let next_tok = sampler.sample(next_logits.values(), None);
         assert!(next_tok.token < n_vocab as u32);
     }
 

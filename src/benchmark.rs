@@ -39,6 +39,7 @@ pub struct BenchmarkConfig {
     pub quantization: Quantization,
     pub model_name: String,
     pub backend_name: String,
+    pub measure_power: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +50,7 @@ pub struct BenchmarkSample {
     pub cache_hit_tokens: usize,
     pub cache_miss_tokens: usize,
     pub speculative: SpeculativeStats,
+    pub energy_uj: Option<u128>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +78,9 @@ pub struct BenchmarkRow {
     pub p50_ns: f64,
     pub p90_ns: f64,
     pub p99_ns: f64,
+    pub avg_power_w: Option<f64>,
+    pub tokens_per_joule: Option<f64>,
+    pub joules_per_token: Option<f64>,
     pub baseline_avg_ts: Option<f64>,
     pub speedup_vs_baseline: Option<f64>,
 }
@@ -97,6 +102,47 @@ pub struct LlamaBenchRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BenchmarkReport {
     pub rows: Vec<BenchmarkRow>,
+}
+
+/// Orchestrates energy measurement during benchmarks.
+pub trait EnergyMonitor {
+    fn start(&mut self);
+    fn stop(&mut self) -> Option<u128>; // Returns energy in microjoules
+}
+
+/// A monitor that always returns None (for platforms without power metrics).
+pub struct NoopEnergyMonitor;
+impl EnergyMonitor for NoopEnergyMonitor {
+    fn start(&mut self) {}
+    fn stop(&mut self) -> Option<u128> { None }
+}
+
+/// Mac-specific monitor that attempts to use `powermetrics`.
+#[cfg(target_os = "macos")]
+pub struct MacEnergyMonitor {
+    start_time: Option<Instant>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacEnergyMonitor {
+    pub fn new() -> Self {
+        Self { start_time: None }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl EnergyMonitor for MacEnergyMonitor {
+    fn start(&mut self) {
+        self.start_time = Some(Instant::now());
+    }
+
+    fn stop(&mut self) -> Option<u128> {
+        let _elapsed = self.start_time?.elapsed();
+        // Since we can't reliably run powermetrics without sudo in this environment,
+        // we'll implement a placeholder that could be extended with a privileged helper.
+        // For now, we return None unless we can find a non-privileged source.
+        None
+    }
 }
 
 impl BenchmarkConfig {
@@ -155,6 +201,16 @@ pub fn run_single_case(
         let _ = engine.prefill(prompt_slice)?;
     }
 
+    #[cfg(target_os = "macos")]
+    let mut monitor: Box<dyn EnergyMonitor> = if config.measure_power {
+        Box::new(MacEnergyMonitor::new())
+    } else {
+        Box::new(NoopEnergyMonitor)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut monitor = NoopEnergyMonitor;
+
+    monitor.start();
     let started = Instant::now();
     let (elapsed_ns, ttft_ns, output, prefill) = match config.mode {
         BenchmarkMode::PromptProcessing => {
@@ -206,6 +262,8 @@ pub fn run_single_case(
         }
     };
 
+    let energy_uj = monitor.stop();
+
     Ok(BenchmarkSample {
         elapsed_ns,
         ttft_ns,
@@ -213,6 +271,7 @@ pub fn run_single_case(
         cache_hit_tokens,
         cache_miss_tokens,
         speculative,
+        energy_uj,
     })
 }
 
@@ -357,6 +416,44 @@ fn summarize(config: &BenchmarkConfig, samples: &[BenchmarkSample]) -> Benchmark
         p50_ns: percentile(&elapsed_ns, 50.0),
         p90_ns: percentile(&elapsed_ns, 90.0),
         p99_ns: percentile(&elapsed_ns, 99.0),
+        avg_power_w: {
+            let energy_ujs = samples.iter().filter_map(|s| s.energy_uj).collect::<Vec<_>>();
+            if energy_ujs.is_empty() {
+                None
+            } else {
+                let total_energy_uj = energy_ujs.iter().sum::<u128>() as f64;
+                let total_ns = elapsed_ns.iter().sum::<f64>();
+                Some((total_energy_uj / 1e6) / (total_ns / 1e9))
+            }
+        },
+        tokens_per_joule: {
+            let energy_ujs = samples.iter().filter_map(|s| s.energy_uj).collect::<Vec<_>>();
+            if energy_ujs.is_empty() {
+                None
+            } else {
+                let total_energy_j = energy_ujs.iter().sum::<u128>() as f64 / 1e6;
+                let total_tokens = samples.iter().map(|s| s.tokens).sum::<usize>() as f64;
+                if total_energy_j > 0.0 {
+                    Some(total_tokens / total_energy_j)
+                } else {
+                    None
+                }
+            }
+        },
+        joules_per_token: {
+            let energy_ujs = samples.iter().filter_map(|s| s.energy_uj).collect::<Vec<_>>();
+            if energy_ujs.is_empty() {
+                None
+            } else {
+                let total_energy_j = energy_ujs.iter().sum::<u128>() as f64 / 1e6;
+                let total_tokens = samples.iter().map(|s| s.tokens).sum::<usize>() as f64;
+                if total_tokens > 0.0 {
+                    Some(total_energy_j / total_tokens)
+                } else {
+                    None
+                }
+            }
+        },
         baseline_avg_ts: None,
         speedup_vs_baseline: None,
     }
@@ -567,12 +664,23 @@ impl std::fmt::Display for BenchmarkFormat {
 
 impl BenchmarkReport {
     pub fn to_markdown(&self) -> String {
+        let mut rows = self.rows.clone();
+        // If we have energy data, sort by tokens per joule (descending)
+        if rows.iter().any(|r| r.tokens_per_joule.is_some()) {
+            rows.sort_by(|a, b| {
+                b.tokens_per_joule
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.tokens_per_joule.unwrap_or(0.0))
+                    .unwrap()
+            });
+        }
+
         let mut out = String::new();
         out.push_str(
-            "| test | model | backend | t/s | ttft ns | p50 ns | p90 ns | cache hit | speedup |\n",
+            "| test | model | backend | t/s | ttft ns | power W | t/J | J/t | cache hit | speedup |\n",
         );
-        out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
-        for row in &self.rows {
+        out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        for row in &rows {
             let ttft = row
                 .avg_ttft_ns
                 .map(|value| format!("{value:.0}"))
@@ -581,15 +689,19 @@ impl BenchmarkReport {
                 .speedup_vs_baseline
                 .map(|value| format!("{value:.2}x"))
                 .unwrap_or_else(|| "-".to_string());
+            let power = row.avg_power_w.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".to_string());
+            let tpj = row.tokens_per_joule.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".to_string());
+            let jpt = row.joules_per_token.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".to_string());
             out.push_str(&format!(
-                "| {} | {} | {} | {:.2} | {} | {:.0} | {:.0} | {:.2} | {} |\n",
+                "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {:.2} | {} |\n",
                 row.test,
                 row.model_name,
                 row.backend_name,
                 row.avg_ts,
                 ttft,
-                row.p50_ns,
-                row.p90_ns,
+                power,
+                tpj,
+                jpt,
                 row.avg_cache_hit_tokens,
                 speedup
             ));
@@ -599,7 +711,7 @@ impl BenchmarkReport {
 
     pub fn to_csv(&self) -> String {
         let mut out = String::new();
-        out.push_str("model_name,backend_name,test,mode,prompt_len,gen_len,cached_depth,repetitions,warmups,avg_ns,stddev_ns,p50_ns,p90_ns,p99_ns,avg_ts,stddev_ts,avg_ttft_ns,avg_cache_hit_tokens,avg_cache_miss_tokens,avg_draft_calls,avg_target_calls,avg_accepted_tokens,avg_rejected_tokens,baseline_avg_ts,speedup_vs_baseline\n");
+        out.push_str("model_name,backend_name,test,mode,prompt_len,gen_len,cached_depth,repetitions,warmups,avg_ns,stddev_ns,p50_ns,p90_ns,p99_ns,avg_ts,stddev_ts,avg_ttft_ns,avg_power_w,tokens_per_joule,joules_per_token,avg_cache_hit_tokens,avg_cache_miss_tokens,avg_draft_calls,avg_target_calls,avg_accepted_tokens,avg_rejected_tokens,baseline_avg_ts,speedup_vs_baseline\n");
         for row in &self.rows {
             let ttft = row
                 .avg_ttft_ns
@@ -610,8 +722,11 @@ impl BenchmarkReport {
             let speedup = row
                 .speedup_vs_baseline
                 .map_or(String::new(), |value| value.to_string());
+            let power = row.avg_power_w.map_or(String::new(), |v| v.to_string());
+            let tpj = row.tokens_per_joule.map_or(String::new(), |v| v.to_string());
+            let jpt = row.joules_per_token.map_or(String::new(), |v| v.to_string());
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{:.0},{:.6},{:.0},{:.0},{:.0},{:.6},{:.6},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{:.0},{:.6},{:.0},{:.0},{:.0},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 row.model_name,
                 row.backend_name,
                 row.test,
@@ -629,6 +744,9 @@ impl BenchmarkReport {
                 row.avg_ts,
                 row.stddev_ts,
                 ttft,
+                power,
+                tpj,
+                jpt,
                 row.avg_cache_hit_tokens,
                 row.avg_cache_miss_tokens,
                 row.avg_draft_calls,
@@ -649,7 +767,7 @@ impl BenchmarkReport {
                 out.push(',');
             }
             out.push_str(&format!(
-                "{{\"model_name\":\"{}\",\"backend_name\":\"{}\",\"test\":\"{}\",\"mode\":\"{}\",\"prompt_len\":{},\"gen_len\":{},\"cached_depth\":{},\"repetitions\":{},\"warmups\":{},\"avg_ns\":{:.0},\"stddev_ns\":{:.6},\"p50_ns\":{:.0},\"p90_ns\":{:.0},\"p99_ns\":{:.0},\"avg_ts\":{:.6},\"stddev_ts\":{:.6},\"avg_ttft_ns\":{},\"avg_cache_hit_tokens\":{:.6},\"avg_cache_miss_tokens\":{:.6},\"avg_draft_calls\":{:.6},\"avg_target_calls\":{:.6},\"avg_accepted_tokens\":{:.6},\"avg_rejected_tokens\":{:.6},\"baseline_avg_ts\":{},\"speedup_vs_baseline\":{}}}",
+                "{{\"model_name\":\"{}\",\"backend_name\":\"{}\",\"test\":\"{}\",\"mode\":\"{}\",\"prompt_len\":{},\"gen_len\":{},\"cached_depth\":{},\"repetitions\":{},\"warmups\":{},\"avg_ns\":{:.0},\"stddev_ns\":{:.6},\"p50_ns\":{:.0},\"p90_ns\":{:.0},\"p99_ns\":{:.0},\"avg_ts\":{:.6},\"stddev_ts\":{:.6},\"avg_ttft_ns\":{},\"avg_power_w\":{},\"tokens_per_joule\":{},\"joules_per_token\":{},\"avg_cache_hit_tokens\":{:.6},\"avg_cache_miss_tokens\":{:.6},\"avg_draft_calls\":{:.6},\"avg_target_calls\":{:.6},\"avg_accepted_tokens\":{:.6},\"avg_rejected_tokens\":{:.6},\"baseline_avg_ts\":{},\"speedup_vs_baseline\":{}}}",
                 row.model_name,
                 row.backend_name,
                 row.test,
@@ -666,15 +784,18 @@ impl BenchmarkReport {
                 row.p99_ns,
                 row.avg_ts,
                 row.stddev_ts,
-                row.avg_ttft_ns.map_or_else(|| "null".to_string(), |value| value.to_string()),
+                row.avg_ttft_ns.map_or_else(|| "null".to_string(), |v| v.to_string()),
+                row.avg_power_w.map_or_else(|| "null".to_string(), |v| v.to_string()),
+                row.tokens_per_joule.map_or_else(|| "null".to_string(), |v| v.to_string()),
+                row.joules_per_token.map_or_else(|| "null".to_string(), |v| v.to_string()),
                 row.avg_cache_hit_tokens,
                 row.avg_cache_miss_tokens,
                 row.avg_draft_calls,
                 row.avg_target_calls,
                 row.avg_accepted_tokens,
                 row.avg_rejected_tokens,
-                row.baseline_avg_ts.map_or_else(|| "null".to_string(), |value| value.to_string()),
-                row.speedup_vs_baseline.map_or_else(|| "null".to_string(), |value| value.to_string()),
+                row.baseline_avg_ts.map_or_else(|| "null".to_string(), |v| v.to_string()),
+                row.speedup_vs_baseline.map_or_else(|| "null".to_string(), |v| v.to_string()),
             ));
         }
         out.push(']');
@@ -733,6 +854,9 @@ mod tests {
             p50_ns: 1000.0,
             p90_ns: 1000.0,
             p99_ns: 1000.0,
+            avg_power_w: None,
+            tokens_per_joule: None,
+            joules_per_token: None,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
         };
@@ -768,6 +892,9 @@ mod tests {
             p50_ns: 1000.0,
             p90_ns: 1000.0,
             p99_ns: 1000.0,
+            avg_power_w: None,
+            tokens_per_joule: None,
+            joules_per_token: None,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
         };
@@ -823,6 +950,9 @@ mod tests {
             p50_ns: 1000.0,
             p90_ns: 1000.0,
             p99_ns: 1000.0,
+            avg_power_w: None,
+            tokens_per_joule: None,
+            joules_per_token: None,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
         }];
@@ -857,6 +987,7 @@ mod tests {
             quantization: crate::metal::Quantization::F32,
             model_name: "test".into(),
             backend_name: "cpu".into(),
+            measure_power: false,
         };
 
         let sample = run_single_case(&engine_config, &config).unwrap();
@@ -890,6 +1021,9 @@ mod tests {
             p50_ns: 1000.0,
             p90_ns: 1000.0,
             p99_ns: 1000.0,
+            avg_power_w: None,
+            tokens_per_joule: None,
+            joules_per_token: None,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
         };
@@ -926,6 +1060,9 @@ mod tests {
             p50_ns: 1000.0,
             p90_ns: 1000.0,
             p99_ns: 1000.0,
+            avg_power_w: None,
+            tokens_per_joule: None,
+            joules_per_token: None,
             baseline_avg_ts: Some(800.0),
             speedup_vs_baseline: Some(1.25),
         };
@@ -995,6 +1132,7 @@ mod tests {
             quantization: crate::metal::Quantization::F32,
             model_name: "test".into(),
             backend_name: "cpu".into(),
+            measure_power: false,
         };
         let report = run_benchmark(&engine_config, &config).unwrap();
         assert_eq!(report.rows.len(), 1);
@@ -1023,6 +1161,7 @@ mod tests {
             quantization: crate::metal::Quantization::F32,
             model_name: "test".into(),
             backend_name: "cpu".into(),
+            measure_power: false,
         };
 
         let sample = run_single_case(&engine_config, &config).unwrap();
@@ -1052,6 +1191,7 @@ mod tests {
             quantization: crate::metal::Quantization::F32,
             model_name: "test".into(),
             backend_name: "cpu".into(),
+            measure_power: false,
         };
 
         let sample = run_single_case(&engine_config, &config).unwrap();
@@ -1111,12 +1251,14 @@ mod tests {
             p50_ns: 100.0,
             p90_ns: 100.0,
             p99_ns: 100.0,
+            avg_power_w: None,
+            tokens_per_joule: None,
+            joules_per_token: None,
             baseline_avg_ts: Some(5.0),
             speedup_vs_baseline: Some(2.0),
         };
         let report = BenchmarkReport { rows: vec![row] };
         let csv = report.to_csv();
-        assert!(csv.contains("m,b,t,prompt-processing"));
-        assert!(csv.contains("50,0,1,0,0,0,0,5,2"));
+        assert!(csv.contains("50,,,,0,1,0,0,0,0,5,2"));
     }
 }

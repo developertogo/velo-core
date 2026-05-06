@@ -85,7 +85,7 @@ mod tests {
         let backend = MockBackend::new(vec![1, 2, 3]);
         let mut draft = GreedyDraftModel::new(backend);
 
-        let predictions = draft.draft(&[1], 2).unwrap();
+        let predictions = draft.draft(&[1], 2, None).unwrap();
 
         assert_eq!(predictions[0].token, 2);
         assert_eq!(predictions[1].token, 3);
@@ -96,7 +96,7 @@ mod tests {
         let backend = MockBackend::new(vec![1, 2, 3]).with_override(1, 9);
         let mut draft = GreedyDraftModel::new(backend);
 
-        let predictions = draft.draft(&[1], 2).unwrap();
+        let predictions = draft.draft(&[1], 2, None).unwrap();
 
         assert_eq!(predictions[0].token, 9);
         assert_eq!(predictions[1].token, 3);
@@ -107,7 +107,7 @@ mod tests {
         let backend = MockBackend::new(vec![1, 2, 3]);
         let mut target = GreedyTargetModel::new(backend);
 
-        let verified = target.verify(&[1], &[9, 9]).unwrap();
+        let verified = target.verify(&[1], &[9, 9], None).unwrap();
 
         assert_eq!(
             verified,

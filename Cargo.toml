@@ -49,6 +49,12 @@ minijinja = { version = "2.1", optional = true }
 tower-http = { version = "0.6.8", features = ["cors", "fs", "trace"], optional = true }
 async-stream = { version = "0.3.6", optional = true }
 
+# Constrained Generation
+llguidance = { version = "1.2.0", default-features = false, features = ["lark"] }
+toktrie = "1.4.0"
+regex-automata = { version = "0.4.13", features = ["meta"] }
+vob = "3.0.6"
+
 [features]
 default = ["serve"]
 serve = ["dep:axum", "dep:serde_json", "dep:tower-http", "dep:async-stream", "dep:minijinja"]

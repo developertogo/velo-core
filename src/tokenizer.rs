@@ -32,6 +32,14 @@ impl Tokenizer {
         Self { tokens, token_to_id, chat_template }
     }
 
+    pub fn vocab_size(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn id_to_token(&self, id: u32) -> &str {
+        self.tokens.get(id as usize).map(|s| s.as_str()).unwrap_or("<unk>")
+    }
+
     /// Encodes a string into a sequence of token IDs using naive greedy longest-match.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         // Naive greedy longest-match tokenization for demo purposes.

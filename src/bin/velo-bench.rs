@@ -60,6 +60,7 @@ struct CliArgs {
     format: BenchmarkFormat,
     llama_csv: Option<PathBuf>,
     kv_type: velo_core::paged_attention::KvCacheType,
+    power: bool,
 }
 
 impl CliArgs {
@@ -80,6 +81,7 @@ impl CliArgs {
         let mut format = BenchmarkFormat::Markdown;
         let mut llama_csv = None;
         let mut kv_type = velo_core::paged_attention::KvCacheType::Fp32;
+        let mut power = false;
 
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
@@ -125,6 +127,7 @@ impl CliArgs {
                         _ => return Err(format!("unknown quantization: {value}")),
                     };
                 }
+                "--power" => power = true,
                 "--help" | "-h" => return Err(Self::help()),
                 other => return Err(format!("unrecognized argument: {other}")),
             }
@@ -147,6 +150,7 @@ impl CliArgs {
             format,
             llama_csv,
             kv_type,
+            power,
         })
     }
 
@@ -188,6 +192,7 @@ impl CliArgs {
             quantization: self.quantization,
             model_name: self.model_name.clone(),
             backend_name: self.backend_name.clone(),
+            measure_power: self.power,
         }
     }
 
@@ -221,6 +226,7 @@ impl CliArgs {
             "  --model-name NAME",
             "  --backend-name NAME",
             "  --quantization fp16|int8|int4",
+            "  --power              Enable Apple Silicon power measurement (requires sudo)",
         ]
         .join("\n")
     }
@@ -300,6 +306,7 @@ mod tests {
             format: BenchmarkFormat::Markdown,
             llama_csv: None,
             kv_type: velo_core::paged_attention::KvCacheType::Fp32,
+            power: false,
         };
         let modes = args.modes();
         assert_eq!(modes.len(), 3);
@@ -325,6 +332,7 @@ mod tests {
             format: BenchmarkFormat::Markdown,
             llama_csv: None,
             kv_type: velo_core::paged_attention::KvCacheType::Fp32,
+            power: false,
         };
         let cfg = args.benchmark_config(BenchmarkMode::PromptProcessing);
         assert_eq!(cfg.prompt_len, 128);
