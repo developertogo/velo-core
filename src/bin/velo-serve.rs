@@ -12,6 +12,7 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::Path;
+use velo_core::paged_attention::KvCacheType;
 use velo_core::{
     load_gguf, EngineConfig, MetalBackend, MetalBackendConfig, MetalMemoryRuntime,
     VeloEngine, VeloScheduler, tokenizer::Tokenizer,
@@ -34,7 +35,7 @@ struct Args {
     slots: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ChatMessage {
     role: String,
     content: String,
@@ -46,6 +47,7 @@ struct ChatCompletionRequest {
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
     #[serde(default)]
+    #[allow(dead_code)]
     stream: bool,
 }
 
@@ -97,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         n_layer: meta.n_layer,
         unified_memory: true,
         max_slots: args.slots,
+        kv_type: KvCacheType::Fp32,
     };
 
     let runtime_config = MetalRuntimeConfig {
@@ -115,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
     let engine_config = EngineConfig {
         memory: memory_config,
         draft_window: 4,
+        kv_type: KvCacheType::Fp32,
     };
    
     let runtime = MetalMemoryRuntime::new(runtime_config)?;
@@ -134,6 +138,8 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/models", get(list_models))
+        .route("/metrics", get(metrics_handler))
         .route("/health", get(|| async { "OK" }))
         .with_state(state);
 
@@ -154,13 +160,10 @@ async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, String> {
-    // 1. Apply Llama 3 Template (Naive)
-    let mut prompt = String::new();
-    prompt.push_str("<|begin_of_text|>");
-    for msg in req.messages {
-        prompt.push_str(&format!("<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>", msg.role, msg.content));
-    }
-    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    // 1. Apply Chat Template (Flexible)
+    let messages_json = serde_json::to_value(&req.messages).map_err(|e| e.to_string())?;
+    let messages_slice = messages_json.as_array().ok_or("Failed to convert messages to array")?;
+    let prompt = state.tokenizer.apply_chat_template(messages_slice, true)?;
 
     let token_ids = state.tokenizer.encode(&prompt);
     let (mut token_rx, _done_rx) = state.scheduler.submit(token_ids, req.max_tokens);
@@ -168,7 +171,14 @@ async fn chat_completions(
     let tokenizer = state.tokenizer.clone();
    
     let stream = async_stream::stream! {
-        while let Some(token) = token_rx.recv().await {
+        while let Some(res) = token_rx.recv().await {
+            let token = match res {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Scheduler error: {:?}", e);
+                    break;
+                }
+            };
             let text = tokenizer.decode(&[token]);
             let resp = ChatStreamResponse {
                 id: "velo-123".into(),
@@ -201,6 +211,69 @@ async fn chat_completions(
     Ok(Sse::new(stream))
 }
 
+async fn list_models() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "object": "list",
+        "data": [
+            {
+                "id": "velo-llama",
+                "object": "model",
+                "created": 123456789,
+                "owned_by": "velo"
+            }
+        ]
+    }))
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
+    let m = state.scheduler.metrics();
+    let total_tokens = m.total_tokens_generated.load(std::sync::atomic::Ordering::Relaxed);
+    let total_reqs = m.total_requests_completed.load(std::sync::atomic::Ordering::Relaxed);
+    let active_slots = m.active_slots.load(std::sync::atomic::Ordering::Relaxed);
+    let total_ttft = m.total_ttft_ms.load(std::sync::atomic::Ordering::Relaxed);
+    let reqs_with_ttft = m.requests_with_ttft.load(std::sync::atomic::Ordering::Relaxed);
+    
+    let avg_ttft = if reqs_with_ttft > 0 {
+        total_ttft as f64 / reqs_with_ttft as f64
+    } else {
+        0.0
+    };
+
+    let uptime = if let Some(start) = m.scheduler_start_time {
+        start.elapsed().as_secs()
+    } else {
+        0
+    };
+
+    let tps = if uptime > 0 {
+        total_tokens as f64 / uptime as f64
+    } else {
+        0.0
+    };
+
+    format!(
+        "# HELP velo_tokens_total Total tokens generated\n\
+         # TYPE velo_tokens_total counter\n\
+         velo_tokens_total {}\n\n\
+         # HELP velo_requests_total Total requests completed\n\
+         # TYPE velo_requests_total counter\n\
+         velo_requests_total {}\n\n\
+         # HELP velo_active_slots Current active slots\n\
+         # TYPE velo_active_slots gauge\n\
+         velo_active_slots {}\n\n\
+         # HELP velo_ttft_ms_avg Average Time To First Token in ms\n\
+         # TYPE velo_ttft_ms_avg gauge\n\
+         velo_ttft_ms_avg {:.2}\n\n\
+         # HELP velo_tokens_per_second Average tokens per second since start\n\
+         # TYPE velo_tokens_per_second gauge\n\
+         velo_tokens_per_second {:.2}\n\n\
+         # HELP velo_uptime_seconds Seconds since scheduler start\n\
+         # TYPE velo_uptime_seconds counter\n\
+         velo_uptime_seconds {}\n",
+        total_tokens, total_reqs, active_slots, avg_ttft, tps, uptime
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -209,26 +282,20 @@ mod tests {
 
     #[test]
     fn test_chat_template() {
-        let req = ChatCompletionRequest {
-            messages: vec![
-                ChatMessage { role: "system".into(), content: "You are a bot".into() },
-                ChatMessage { role: "user".into(), content: "Hello".into() },
-            ],
-            max_tokens: 10,
-            stream: true,
-        };
+        let mut tokenizer = Tokenizer::from_gguf(&velo_core::gguf::GgufFile {
+            version: 3,
+            metadata: std::collections::HashMap::new(),
+            tensors: std::collections::HashMap::new(),
+            data_offset: 0,
+        });
+        // Set a custom template for testing
+        tokenizer.chat_template = Some("{{ messages[0].content }}".to_string());
 
-        let mut prompt = String::new();
-        prompt.push_str("<|begin_of_text|>");
-        for msg in req.messages {
-            prompt.push_str(&format!("<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>", msg.role, msg.content));
-        }
-        prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        let messages = vec![
+            serde_json::json!({ "role": "user", "content": "Hello" }),
+        ];
 
-        assert!(prompt.contains("system"));
-        assert!(prompt.contains("user"));
-        assert!(prompt.contains("You are a bot"));
-        assert!(prompt.contains("Hello"));
-        assert!(prompt.contains("<|begin_of_text|>"));
+        let prompt = tokenizer.apply_chat_template(&messages, true).unwrap();
+        assert_eq!(prompt, "Hello");
     }
 }

@@ -2,6 +2,7 @@ use crate::radix_cache::{CacheLookup, TokenId};
 use crate::speculative::{
     DraftModel, NextTokenPrediction, Result, SpeculativeError, TargetModel, VerifyStep,
 };
+use crate::sampling::{Sampler, GreedySampler};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenLogits {
@@ -14,6 +15,10 @@ pub trait CausalLmBackend {
     }
 
     fn bind_slot(&mut self, _slot: crate::slot_manager::SlotId) -> Result<()> {
+        Ok(())
+    }
+
+    fn switch_model(&mut self, _name: &str, _pool: &crate::model_pool::ModelPool) -> Result<()> {
         Ok(())
     }
 
@@ -40,8 +45,6 @@ pub trait CausalLmBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GreedySampler;
 
 #[derive(Debug, Clone)]
 pub struct GreedyDraftModel<B> {
@@ -69,22 +72,6 @@ impl TokenLogits {
     }
 }
 
-impl GreedySampler {
-    pub fn sample(&self, logits: &TokenLogits) -> NextTokenPrediction {
-        let (token, confidence) = logits
-            .values()
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .expect("TokenLogits validates non-empty logits");
-
-        NextTokenPrediction {
-            token: token as TokenId,
-            confidence,
-        }
-    }
-}
 
 impl<B> GreedyDraftModel<B> {
     pub fn new(backend: B) -> Self {
@@ -126,13 +113,17 @@ where
         self.backend.bind_slot(slot)
     }
 
+    fn switch_model(&mut self, name: &str, pool: &crate::model_pool::ModelPool) -> Result<()> {
+        self.backend.switch_model(name, pool)
+    }
+
     fn draft(&mut self, context: &[TokenId], max_tokens: usize) -> Result<Vec<NextTokenPrediction>> {
         let sampler = GreedySampler;
         let mut local_context = context.to_vec();
         let mut predictions = Vec::with_capacity(max_tokens);
 
         for _ in 0..max_tokens {
-            let prediction = sampler.sample(&self.backend.next_logits(&local_context)?);
+            let prediction = sampler.sample(self.backend.next_logits(&local_context)?.values());
             local_context.push(prediction.token);
             predictions.push(prediction);
         }
@@ -168,7 +159,7 @@ where
             let batch_logits = self.backend.next_logits_batch(&active_contexts)?;
 
             for (batch_idx, &req_idx) in active_indices.iter().enumerate() {
-                let prediction = sampler.sample(&batch_logits[batch_idx]);
+                let prediction = sampler.sample(batch_logits[batch_idx].values());
                 contexts[req_idx].push(prediction.token);
                 results[req_idx].push(prediction);
             }
@@ -190,6 +181,10 @@ where
         self.backend.bind_slot(slot)
     }
 
+    fn switch_model(&mut self, name: &str, pool: &crate::model_pool::ModelPool) -> Result<()> {
+        self.backend.switch_model(name, pool)
+    }
+
     fn verify(&mut self, context: &[TokenId], drafted: &[TokenId]) -> Result<Vec<VerifyStep>> {
         let sampler = GreedySampler;
 
@@ -198,7 +193,7 @@ where
             .verify_logits(context, drafted)?
             .iter()
             .map(|logits| VerifyStep {
-                expected: sampler.sample(logits).token,
+                expected: sampler.sample(logits.values()).token,
             })
             .collect())
     }
@@ -217,7 +212,7 @@ where
                 logits_vec
                     .into_iter()
                     .map(|logits| VerifyStep {
-                        expected: sampler.sample(&logits).token,
+                        expected: sampler.sample(logits.values()).token,
                     })
                     .collect()
             })
@@ -269,7 +264,7 @@ mod tests {
         let logits = TokenLogits::new(vec![0.1, 0.8, 0.2]).unwrap();
 
         assert_eq!(
-            GreedySampler.sample(&logits),
+            GreedySampler.sample(logits.values()),
             NextTokenPrediction {
                 token: 1,
                 confidence: 0.8,
@@ -343,7 +338,7 @@ mod tests {
     #[test]
     fn greedy_sampler_handles_single_logit() {
         let logits = TokenLogits::new(vec![0.5]).unwrap();
-        let prediction = GreedySampler.sample(&logits);
+        let prediction = GreedySampler.sample(logits.values());
         assert_eq!(prediction.token, 0);
         assert_eq!(prediction.confidence, 0.5);
     }
@@ -351,7 +346,7 @@ mod tests {
     #[test]
     fn greedy_sampler_picks_last_max() {
         let logits = TokenLogits::new(vec![0.5, 0.5]).unwrap();
-        let prediction = GreedySampler.sample(&logits);
+        let prediction = GreedySampler.sample(logits.values());
         assert_eq!(prediction.token, 1);
     }
 

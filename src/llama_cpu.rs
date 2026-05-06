@@ -63,6 +63,7 @@ fn rms_norm(x: &mut [f32], w: &[f32], eps: f32) {
 /// Matrix-vector multiply: `out[r] += sum_c W[r,c] * x[c]` (no bias).
 ///
 /// `w` is a **dequantised** row-major matrix of shape `[rows, cols]`.
+#[allow(dead_code)]
 fn matvec(out: &mut [f32], w: &[f32], x: &[f32], rows: usize, cols: usize) {
     for r in 0..rows {
         let row = &w[r * cols..(r + 1) * cols];

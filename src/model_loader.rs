@@ -12,6 +12,7 @@ use std::path::Path;
 
 use crate::gguf::{GgmlType, GgufError, GgufFile, TensorInfo};
 use crate::metal::Quantization;
+use crate::paged_attention::KvCacheType;
 
 // ── ModelMeta ─────────────────────────────────────────────────────────────────
 
@@ -122,6 +123,20 @@ impl ModelMeta {
             norm_eps,
             quantization,
         })
+    }
+
+    /// Returns the number of bytes required to store one token in the KV cache for ONE head.
+    pub fn kv_bytes_per_token_per_head(&self, kv_type: KvCacheType) -> usize {
+        match kv_type {
+            KvCacheType::Fp32 => self.head_dim * 4,
+            KvCacheType::Int8 => self.head_dim + 4, // head_dim bytes + 4 bytes scale
+            KvCacheType::Fp8 => self.head_dim + 4, // Same for now
+        }
+    }
+
+    /// Returns the number of bytes required to store one token in the KV cache across ALL heads.
+    pub fn kv_bytes_per_token(&self, kv_type: KvCacheType) -> usize {
+        self.n_head_kv * self.kv_bytes_per_token_per_head(kv_type)
     }
 }
 

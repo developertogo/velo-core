@@ -20,6 +20,10 @@ pub trait DraftModel {
         Ok(())
     }
 
+    fn switch_model(&mut self, _name: &str, _pool: &crate::model_pool::ModelPool) -> Result<()> {
+        Ok(())
+    }
+
     fn draft(&mut self, context: &[TokenId], max_tokens: usize) -> Result<Vec<NextTokenPrediction>>;
 
     fn draft_batch(
@@ -42,6 +46,10 @@ pub trait TargetModel {
         Ok(())
     }
 
+    fn switch_model(&mut self, _name: &str, _pool: &crate::model_pool::ModelPool) -> Result<()> {
+        Ok(())
+    }
+
     fn verify(&mut self, context: &[TokenId], drafted: &[TokenId]) -> Result<Vec<VerifyStep>>;
 
     fn verify_batch(
@@ -58,6 +66,7 @@ pub trait TargetModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeculativeDecoder {
     draft_window: usize,
+    max_window: usize,
 }
 
 impl SpeculativeDecoder {
@@ -69,6 +78,7 @@ impl SpeculativeDecoder {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeculativeSession {
     draft_window: usize,
+    max_window: usize,
     prompt: Vec<TokenId>,
     context: Vec<TokenId>,
     stats: SpeculativeStats,
@@ -112,7 +122,14 @@ impl SpeculativeDecoder {
             return Err(SpeculativeError::EmptyDraftWindow);
         }
 
-        Ok(Self { draft_window })
+        Ok(Self { draft_window, max_window: draft_window * 2 })
+    }
+
+    pub fn with_max_window(draft_window: usize, max_window: usize) -> Result<Self> {
+        if draft_window == 0 || max_window < draft_window {
+            return Err(SpeculativeError::EmptyDraftWindow);
+        }
+        Ok(Self { draft_window, max_window })
     }
 
     pub fn generate<D, T>(
@@ -156,6 +173,7 @@ impl SpeculativeDecoder {
     pub fn begin(&self, prompt: &[TokenId]) -> Result<SpeculativeSession> {
         Ok(SpeculativeSession {
             draft_window: self.draft_window,
+            max_window: self.max_window,
             prompt: prompt.to_vec(),
             context: prompt.to_vec(),
             stats: SpeculativeStats::default(),
@@ -183,6 +201,10 @@ impl SpeculativeSession {
 
     pub fn take_rejected_token(&mut self) -> Option<TokenId> {
         self.rejected_token.take()
+    }
+
+    pub fn current_window(&self) -> usize {
+        self.draft_window
     }
 
     pub fn draft<D, T>(
@@ -254,6 +276,7 @@ impl SpeculativeSession {
             self.rejected_token = None;
         }
 
+        self.adjust_window(accepted_this_round, drafted.len());
         Ok(accepted)
     }
 
@@ -301,6 +324,7 @@ impl SpeculativeSession {
             self.rejected_token = None;
         }
 
+        self.adjust_window(accepted_this_round, drafted.len());
         Ok(accepted)
     }
 
@@ -310,6 +334,16 @@ impl SpeculativeSession {
 
     pub fn record_target_call(&mut self) {
         self.stats.target_calls += 1;
+    }
+
+    fn adjust_window(&mut self, accepted_count: usize, drafted_count: usize) {
+        if accepted_count == drafted_count {
+            if self.draft_window < self.max_window {
+                self.draft_window += 1;
+            }
+        } else {
+            self.draft_window = (accepted_count + 1).max(1);
+        }
     }
 }
 
@@ -545,8 +579,26 @@ mod tests {
         assert!(session.draft(&mut BadDraft, &mut OkTarget, 4).is_err());
         assert!(session.draft(&mut EmptyDraft, &mut OkTarget, 4).unwrap().is_empty());
        
-        let mut session = decoder.begin(&[1]).unwrap();
         let mut good_draft = ScriptedDraft { script: vec![1, 2, 3] };
         assert!(session.draft(&mut good_draft, &mut BadTarget, 4).is_err());
+    }
+
+    #[test]
+    fn test_dynamic_draft_window() {
+        let decoder = SpeculativeDecoder::new(2).unwrap();
+        let mut session = decoder.begin(&[1]).unwrap();
+        assert_eq!(session.current_window(), 2);
+
+        // 1. Full acceptance should grow window
+        let drafted = vec![NextTokenPrediction { token: 2, confidence: 1.0 }, NextTokenPrediction { token: 3, confidence: 1.0 }];
+        let verified = vec![VerifyStep { expected: 2 }, VerifyStep { expected: 3 }];
+        session.commit(&drafted, &verified).unwrap();
+        assert_eq!(session.current_window(), 3);
+
+        // 2. Rejection should shrink window
+        let drafted = vec![NextTokenPrediction { token: 4, confidence: 1.0 }, NextTokenPrediction { token: 9, confidence: 1.0 }];
+        let verified = vec![VerifyStep { expected: 4 }, VerifyStep { expected: 5 }]; // 5 != 9
+        session.commit(&drafted, &verified).unwrap();
+        assert_eq!(session.current_window(), 2); // accepted=1 + 1 = 2
     }
 }
