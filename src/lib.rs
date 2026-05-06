@@ -17,6 +17,9 @@ pub mod scheduler;
 pub mod tokenizer;
 pub mod sampling;
 pub mod model_pool;
+pub mod constraints;
+
+pub use constraints::{CfgMatcher, Constraint};
 
 pub use benchmark::{
     compare_with_llama_csv, load_llama_csv, parse_llama_csv, BenchmarkConfig, BenchmarkFormat,

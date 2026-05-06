@@ -117,15 +117,27 @@ where
         self.backend.switch_model(name, pool)
     }
 
-    fn draft(&mut self, context: &[TokenId], max_tokens: usize) -> Result<Vec<NextTokenPrediction>> {
+    fn draft(
+        &mut self,
+        context: &[TokenId],
+        max_tokens: usize,
+        mut matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
+    ) -> Result<Vec<NextTokenPrediction>> {
         let sampler = GreedySampler;
         let mut local_context = context.to_vec();
         let mut predictions = Vec::with_capacity(max_tokens);
 
         for _ in 0..max_tokens {
-            let prediction = sampler.sample(self.backend.next_logits(&local_context)?.values());
+            let mask = matcher.as_mut().map(|m| m.next_mask());
+            let prediction = sampler.sample(
+                self.backend.next_logits(&local_context)?.values(),
+                mask.as_ref(),
+            );
             local_context.push(prediction.token);
             predictions.push(prediction);
+            if let Some(m) = matcher.as_mut() {
+                m.advance(prediction.token);
+            }
         }
 
         Ok(predictions)
@@ -133,19 +145,19 @@ where
 
     fn draft_batch(
         &mut self,
-        requests: &[(&[TokenId], usize)],
+        requests: &mut [(&[TokenId], usize, Option<&mut (dyn crate::constraints::CfgMatcher + '_)>)],
     ) -> Result<Vec<Vec<NextTokenPrediction>>> {
         let sampler = GreedySampler;
         let mut results: Vec<Vec<NextTokenPrediction>> =
-            requests.iter().map(|(_, max)| Vec::with_capacity(*max)).collect();
-        let mut contexts: Vec<Vec<TokenId>> = requests.iter().map(|(ctx, _)| ctx.to_vec()).collect();
-        let max_steps = requests.iter().map(|(_, max)| *max).max().unwrap_or(0);
+            requests.iter().map(|(_, max, _)| Vec::with_capacity(*max)).collect();
+        let mut contexts: Vec<Vec<TokenId>> = requests.iter().map(|(ctx, _, _)| ctx.to_vec()).collect();
+        let max_steps = requests.iter().map(|(_, max, _)| *max).max().unwrap_or(0);
 
         for _ in 0..max_steps {
             let active_indices: Vec<usize> = requests
                 .iter()
                 .enumerate()
-                .filter(|(i, (_, max))| results[*i].len() < *max)
+                .filter(|(i, (_, max, _))| results[*i].len() < *max)
                 .map(|(i, _)| i)
                 .collect();
 
@@ -159,9 +171,13 @@ where
             let batch_logits = self.backend.next_logits_batch(&active_contexts)?;
 
             for (batch_idx, &req_idx) in active_indices.iter().enumerate() {
-                let prediction = sampler.sample(batch_logits[batch_idx].values());
+                let mask = requests[req_idx].2.as_mut().map(|m| m.next_mask());
+                let prediction = sampler.sample(batch_logits[batch_idx].values(), mask.as_ref());
                 contexts[req_idx].push(prediction.token);
                 results[req_idx].push(prediction);
+                if let Some(m) = requests[req_idx].2.as_mut() {
+                    m.advance(prediction.token);
+                }
             }
         }
 
@@ -185,38 +201,56 @@ where
         self.backend.switch_model(name, pool)
     }
 
-    fn verify(&mut self, context: &[TokenId], drafted: &[TokenId]) -> Result<Vec<VerifyStep>> {
+    fn verify(
+        &mut self,
+        context: &[TokenId],
+        drafted: &[TokenId],
+        mut matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
+    ) -> Result<Vec<VerifyStep>> {
         let sampler = GreedySampler;
+        let logits_vec = self.backend.verify_logits(context, drafted)?;
+        let mut steps = Vec::with_capacity(drafted.len());
 
-        Ok(self
-            .backend
-            .verify_logits(context, drafted)?
-            .iter()
-            .map(|logits| VerifyStep {
-                expected: sampler.sample(logits.values()).token,
-            })
-            .collect())
+        for logits in logits_vec {
+            let mask = matcher.as_mut().map(|m| m.next_mask());
+            let prediction = sampler.sample(logits.values(), mask.as_ref());
+            steps.push(VerifyStep {
+                expected: prediction.token,
+            });
+            if let Some(m) = matcher.as_mut() {
+                m.advance(prediction.token);
+            }
+        }
+
+        Ok(steps)
     }
 
     fn verify_batch(
         &mut self,
-        requests: &[(&[TokenId], &[TokenId])],
+        requests: &mut [(&[TokenId], &[TokenId], Option<&mut (dyn crate::constraints::CfgMatcher + '_)>)],
     ) -> Result<Vec<Vec<VerifyStep>>> {
         let sampler = GreedySampler;
+        let verify_reqs: Vec<(&[TokenId], &[TokenId])> = requests.iter().map(|(ctx, drafted, _)| (*ctx, *drafted)).collect();
+        
+        let batch_logits = self.backend.verify_logits_batch(&verify_reqs)?;
+        let mut results = Vec::with_capacity(requests.len());
 
-        Ok(self
-            .backend
-            .verify_logits_batch(requests)?
-            .into_iter()
-            .map(|logits_vec| {
-                logits_vec
-                    .into_iter()
-                    .map(|logits| VerifyStep {
-                        expected: sampler.sample(logits.values()).token,
-                    })
-                    .collect()
-            })
-            .collect())
+        for (i, logits_vec) in batch_logits.into_iter().enumerate() {
+            let mut steps = Vec::with_capacity(logits_vec.len());
+            for logits in logits_vec {
+                let mask = requests[i].2.as_mut().map(|m| m.next_mask());
+                let prediction = sampler.sample(logits.values(), mask.as_ref());
+                steps.push(VerifyStep {
+                    expected: prediction.token,
+                });
+                if let Some(m) = requests[i].2.as_mut() {
+                    m.advance(prediction.token);
+                }
+            }
+            results.push(steps);
+        }
+
+        Ok(results)
     }
 }
 
@@ -264,7 +298,7 @@ mod tests {
         let logits = TokenLogits::new(vec![0.1, 0.8, 0.2]).unwrap();
 
         assert_eq!(
-            GreedySampler.sample(logits.values()),
+            GreedySampler.sample(logits.values(), None),
             NextTokenPrediction {
                 token: 1,
                 confidence: 0.8,
@@ -280,7 +314,7 @@ mod tests {
         };
         let mut draft = GreedyDraftModel::new(backend);
 
-        let predictions = draft.draft(&[4], 2).unwrap();
+        let predictions = draft.draft(&[4], 2, None).unwrap();
 
         assert_eq!(
             predictions,
@@ -305,7 +339,7 @@ mod tests {
         };
         let mut target = GreedyTargetModel::new(backend);
 
-        let verified = target.verify(&[2], &[9, 9]).unwrap();
+        let verified = target.verify(&[2], &[9, 9], None).unwrap();
 
         assert_eq!(
             verified,
@@ -338,7 +372,7 @@ mod tests {
     #[test]
     fn greedy_sampler_handles_single_logit() {
         let logits = TokenLogits::new(vec![0.5]).unwrap();
-        let prediction = GreedySampler.sample(logits.values());
+        let prediction = GreedySampler.sample(logits.values(), None);
         assert_eq!(prediction.token, 0);
         assert_eq!(prediction.confidence, 0.5);
     }
@@ -346,7 +380,7 @@ mod tests {
     #[test]
     fn greedy_sampler_picks_last_max() {
         let logits = TokenLogits::new(vec![0.5, 0.5]).unwrap();
-        let prediction = GreedySampler.sample(logits.values());
+        let prediction = GreedySampler.sample(logits.values(), None);
         assert_eq!(prediction.token, 1);
     }
 

@@ -24,16 +24,22 @@ pub trait DraftModel {
         Ok(())
     }
 
-    fn draft(&mut self, context: &[TokenId], max_tokens: usize) -> Result<Vec<NextTokenPrediction>>;
+    fn draft(
+        &mut self,
+        context: &[TokenId],
+        max_tokens: usize,
+        matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
+    ) -> Result<Vec<NextTokenPrediction>>;
 
     fn draft_batch(
         &mut self,
-        requests: &[(&[TokenId], usize)],
+        requests: &mut [(&[TokenId], usize, Option<&mut (dyn crate::constraints::CfgMatcher + '_)>)],
     ) -> Result<Vec<Vec<NextTokenPrediction>>> {
-        requests
-            .iter()
-            .map(|(ctx, max)| self.draft(ctx, *max))
-            .collect()
+        let mut results = Vec::with_capacity(requests.len());
+        for (ctx, max, matcher) in requests {
+            results.push(self.draft(ctx, *max, matcher.as_mut().map(|m| *m as &mut (dyn crate::constraints::CfgMatcher + '_)))?);
+        }
+        Ok(results)
     }
 }
 
@@ -50,16 +56,22 @@ pub trait TargetModel {
         Ok(())
     }
 
-    fn verify(&mut self, context: &[TokenId], drafted: &[TokenId]) -> Result<Vec<VerifyStep>>;
+    fn verify(
+        &mut self,
+        context: &[TokenId],
+        drafted: &[TokenId],
+        matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
+    ) -> Result<Vec<VerifyStep>>;
 
     fn verify_batch(
         &mut self,
-        requests: &[(&[TokenId], &[TokenId])],
+        requests: &mut [(&[TokenId], &[TokenId], Option<&mut (dyn crate::constraints::CfgMatcher + '_)>)],
     ) -> Result<Vec<Vec<VerifyStep>>> {
-        requests
-            .iter()
-            .map(|(ctx, drafted)| self.verify(ctx, drafted))
-            .collect()
+        let mut results = Vec::with_capacity(requests.len());
+        for (ctx, drafted, matcher) in requests {
+            results.push(self.verify(ctx, drafted, matcher.as_mut().map(|m| *m as &mut (dyn crate::constraints::CfgMatcher + '_)))?);
+        }
+        Ok(results)
     }
 }
 
@@ -218,7 +230,7 @@ impl SpeculativeSession {
         T: TargetModel,
     {
         let requested = max_new_tokens.min(self.draft_window);
-        let predictions = draft_model.draft(&self.context, requested)?;
+        let predictions = draft_model.draft(&self.context, requested, None)?;
         self.stats.draft_calls += 1;
 
         if predictions.len() > requested {
@@ -238,7 +250,7 @@ impl SpeculativeSession {
             .collect::<Vec<_>>();
         self.stats.drafted_tokens += drafted.len();
 
-        let verified = target_model.verify(&self.context, &drafted)?;
+        let verified = target_model.verify(&self.context, &drafted, None)?;
         self.stats.target_calls += 1;
 
         if verified.len() != drafted.len() {
@@ -383,6 +395,7 @@ mod tests {
             &mut self,
             context: &[TokenId],
             max_tokens: usize,
+            _matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
         ) -> Result<Vec<NextTokenPrediction>> {
             Ok(self.script[context.len()..]
                 .iter()
@@ -401,7 +414,7 @@ mod tests {
     }
 
     impl TargetModel for ScriptedTarget {
-        fn verify(&mut self, context: &[TokenId], drafted: &[TokenId]) -> Result<Vec<VerifyStep>> {
+        fn verify(&mut self, context: &[TokenId], drafted: &[TokenId], _matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>) -> Result<Vec<VerifyStep>> {
             Ok(self.script[context.len()..]
                 .iter()
                 .take(drafted.len())
@@ -511,13 +524,13 @@ mod tests {
 
     #[test]
     fn batch_default_impls() {
-        struct D; impl DraftModel for D { fn draft(&mut self, _: &[TokenId], m: usize) -> Result<Vec<NextTokenPrediction>> { Ok(vec![NextTokenPrediction{token:1, confidence:1.0}; m]) } }
-        struct T; impl TargetModel for T { fn verify(&mut self, _: &[TokenId], d: &[TokenId]) -> Result<Vec<VerifyStep>> { Ok(vec![VerifyStep{expected:1}; d.len()]) } }
+        struct D; impl DraftModel for D { fn draft(&mut self, _: &[TokenId], m: usize, _: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>) -> Result<Vec<NextTokenPrediction>> { Ok(vec![NextTokenPrediction{token:1, confidence:1.0}; m]) } }
+        struct T; impl TargetModel for T { fn verify(&mut self, _: &[TokenId], d: &[TokenId], _: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>) -> Result<Vec<VerifyStep>> { Ok(vec![VerifyStep{expected:1}; d.len()]) } }
        
         let mut d = D;
         let mut t = T;
-        assert!(d.draft_batch(&[(&[1], 1)]).is_ok());
-        assert!(t.verify_batch(&[(&[1], &[1])]).is_ok());
+        assert!(d.draft_batch(&mut [(&[1], 1, None)]).is_ok());
+        assert!(t.verify_batch(&mut [(&[1], &[1], None)]).is_ok());
         assert!(d.bind_slot(crate::slot_manager::SlotId(0)).is_ok());
         assert!(t.bind_slot(crate::slot_manager::SlotId(0)).is_ok());
     }
@@ -553,25 +566,25 @@ mod tests {
        
         struct BadDraft;
         impl DraftModel for BadDraft {
-            fn draft(&mut self, _: &[TokenId], _: usize) -> Result<Vec<NextTokenPrediction>> {
+            fn draft(&mut self, _: &[TokenId], _: usize, _: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>) -> Result<Vec<NextTokenPrediction>> {
                 Ok(vec![NextTokenPrediction{token:1, confidence:1.0}; 10]) // Too many
             }
         }
         struct EmptyDraft;
         impl DraftModel for EmptyDraft {
-            fn draft(&mut self, _: &[TokenId], _: usize) -> Result<Vec<NextTokenPrediction>> {
+            fn draft(&mut self, _: &[TokenId], _: usize, _: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>) -> Result<Vec<NextTokenPrediction>> {
                 Ok(vec![])
             }
         }
         struct OkTarget;
         impl TargetModel for OkTarget {
-            fn verify(&mut self, _: &[TokenId], d: &[TokenId]) -> Result<Vec<VerifyStep>> {
+            fn verify(&mut self, _: &[TokenId], d: &[TokenId], _: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>) -> Result<Vec<VerifyStep>> {
                 Ok(vec![VerifyStep{expected:1}; d.len()])
             }
         }
         struct BadTarget;
         impl TargetModel for BadTarget {
-            fn verify(&mut self, _: &[TokenId], _: &[TokenId]) -> Result<Vec<VerifyStep>> {
+            fn verify(&mut self, _: &[TokenId], _: &[TokenId], _: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>) -> Result<Vec<VerifyStep>> {
                 Ok(vec![]) // Wrong length
             }
         }

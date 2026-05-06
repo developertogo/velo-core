@@ -13,7 +13,6 @@ use crate::speculative::{
 /// `VeloEngine` orchestrates the radix-prefix cache, paged-attention memory,
 /// and the speculative draft/verify loop. It uses a `SlotPool` to isolate
 /// concurrent requests and provide stable indexing for GPU backends.
-#[derive(Debug)]
 pub struct VeloEngine<R = CpuMemoryRuntime> {
     /// Orchestrates the draft-and-verify speculative loop.
     decoder: SpeculativeDecoder,
@@ -23,6 +22,18 @@ pub struct VeloEngine<R = CpuMemoryRuntime> {
     runtime: R,
     /// Pool of stable indexes for concurrent request state.
     slot_pool: crate::slot_manager::SlotPool,
+    /// Factory for creating grammar matchers.
+    pub parser_factory: Option<std::sync::Arc<llguidance::ParserFactory>>,
+}
+
+impl<R> std::fmt::Debug for VeloEngine<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VeloEngine")
+            .field("decoder", &self.decoder)
+            .field("prefix_cache", &self.prefix_cache)
+            .field("slot_pool", &self.slot_pool)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +70,8 @@ pub struct BatchRequest {
     pub prompt: Vec<TokenId>,
     /// Maximum number of new tokens to generate.
     pub max_new_tokens: usize,
+    /// Optional grammar/regex constraint.
+    pub constraint: Option<crate::constraints::Constraint>,
 }
 
 /// Internal state for a request currently being processed in a batch.
@@ -73,6 +86,8 @@ pub struct ActiveRequest {
     pub generated: Vec<TokenId>,
     /// Prefill results (prefix cache hits/misses).
     pub prefill: EnginePrefillOutput,
+    /// Optional grammar matcher for constrained decoding.
+    pub matcher: Option<Box<dyn crate::constraints::CfgMatcher>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +131,7 @@ where
             prefix_cache: RadixCache::new(),
             slot_pool: crate::slot_manager::SlotPool::new(config.memory.max_slots),
             runtime,
+            parser_factory: None,
         })
     }
 
@@ -152,6 +168,7 @@ where
             vec![BatchRequest {
                 prompt: prompt.to_vec(),
                 max_new_tokens,
+                constraint: None,
             }],
         )?;
 
@@ -198,12 +215,31 @@ where
 
             let session = self.decoder.begin(&req.prompt)?;
 
+            let matcher = if let Some(constraint) = req.constraint {
+                 if let Some(factory) = &self.parser_factory {
+                    let grammar = match constraint {
+                        crate::constraints::Constraint::Regex(r) => llguidance::api::TopLevelGrammar::from_regex(&r),
+                        crate::constraints::Constraint::JsonSchema(j) => llguidance::api::TopLevelGrammar::from_json_schema(j),
+                        crate::constraints::Constraint::Lark(l) => llguidance::api::TopLevelGrammar::from_lark(l),
+                    };
+                    // TODO: Need vocab_size here.
+                    // Actually, let's assume 32000 for now or get it from somewhere.
+                    // For now, we'll just skip it if we don't have a factory.
+                    crate::constraints::LlguidanceMatcher::new(factory, grammar, 32000).ok().map(|m| Box::new(m) as Box<dyn crate::constraints::CfgMatcher>)
+                 } else {
+                    None
+                 }
+            } else {
+                None
+            };
+
             active.push(ActiveRequest {
                 session,
                 slot_id,
                 max_new_tokens: req.max_new_tokens,
                 generated: Vec::new(),
                 prefill,
+                matcher,
             });
         }
 
@@ -229,17 +265,17 @@ where
 
             // 1. Prepare and execute Draft Batch
             let draft_results = {
-                let draft_reqs: Vec<(&[TokenId], usize)> = active_indices
-                    .iter()
-                    .map(|&idx| {
-                        let req = &active[idx];
+                let mut draft_reqs: Vec<(&[TokenId], usize, Option<&mut (dyn crate::constraints::CfgMatcher + '_)>)> = active
+                    .iter_mut()
+                    .filter(|req| req.generated.len() < req.max_new_tokens)
+                    .map(|req| {
                         let remaining = req.max_new_tokens - req.generated.len();
                         let requested = remaining.min(self.decoder.draft_window());
-                        (req.session.context(), requested)
+                        (req.session.context(), requested, req.matcher.as_deref_mut())
                     })
                     .collect();
 
-                draft_model.draft_batch(&draft_reqs)?
+                draft_model.draft_batch(&mut draft_reqs)?
             };
 
             for &idx in &active_indices {
@@ -255,15 +291,17 @@ where
             }
 
             let verify_results = {
-                let verify_reqs: Vec<(&[TokenId], &[TokenId])> = active_indices
-                    .iter()
+                let mut verify_reqs: Vec<(&[TokenId], &[TokenId], Option<&mut (dyn crate::constraints::CfgMatcher + '_)>)> = active
+                    .iter_mut()
                     .enumerate()
-                    .map(|(i, &idx)| {
-                        (active[idx].session.context(), drafted_tokens_storage[i].as_slice())
+                    .filter(|(_, req)| req.generated.len() < req.max_new_tokens)
+                    .enumerate()
+                    .map(|(batch_idx, (_, req))| {
+                        (req.session.context(), drafted_tokens_storage[batch_idx].as_slice(), req.matcher.as_deref_mut())
                     })
                     .collect();
 
-                target_model.verify_batch(&verify_reqs)?
+                target_model.verify_batch(&mut verify_reqs)?
             };
 
             for &idx in &active_indices {
@@ -442,6 +480,7 @@ mod tests {
             &mut self,
             context: &[TokenId],
             max_tokens: usize,
+            _matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
         ) -> SpeculativeResult<Vec<NextTokenPrediction>> {
             Ok(self.script[context.len()..]
                 .iter()
@@ -476,6 +515,7 @@ mod tests {
             &mut self,
             context: &[TokenId],
             drafted: &[TokenId],
+            _matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
         ) -> SpeculativeResult<Vec<VerifyStep>> {
             Ok(self.script[context.len()..]
                 .iter()
@@ -745,10 +785,12 @@ mod tests {
             BatchRequest {
                 prompt: vec![1],
                 max_new_tokens: 2,
+                constraint: None,
             },
             BatchRequest {
                 prompt: vec![10; 11],
                 max_new_tokens: 3,
+                constraint: None,
             },
         ];
 
@@ -789,10 +831,12 @@ mod tests {
             BatchRequest {
                 prompt: vec![1],
                 max_new_tokens: 1,
+                constraint: None,
             },
             BatchRequest {
                 prompt: vec![10; 11],
                 max_new_tokens: 2,
+                constraint: None,
             },
         ];
 
@@ -825,10 +869,12 @@ mod tests {
             BatchRequest {
                 prompt: vec![0],
                 max_new_tokens: 1,
+                constraint: None,
             },
             BatchRequest {
                 prompt: vec![0],
                 max_new_tokens: 1,
+                constraint: None,
             },
         ];
 

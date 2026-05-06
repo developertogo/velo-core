@@ -251,16 +251,16 @@ impl VeloScheduler {
     {
         // This is a simplified version of generate_batch logic, but running only ONE step.
         // 1. Draft
-        let draft_reqs: Vec<(&[TokenId], usize)> = active
-            .iter()
+        let mut draft_reqs: Vec<(&[TokenId], usize, Option<&mut (dyn crate::constraints::CfgMatcher + '_)>)> = active
+            .iter_mut()
             .map(|req| {
                 let remaining = req.max_new_tokens - req.generated_count;
                 let window = engine.decoder().draft_window().min(remaining);
-                (req.session.context(), window)
+                (req.session.context(), window, None)
             })
             .collect();
 
-        let draft_results = draft_model.draft_batch(&draft_reqs)?;
+        let draft_results = draft_model.draft_batch(&mut draft_reqs)?;
 
         // 2. Verify
         let mut drafted_tokens_storage = Vec::with_capacity(active.len());
@@ -269,15 +269,15 @@ impl VeloScheduler {
             drafted_tokens_storage.push(drafted);
         }
 
-        let verify_reqs: Vec<(&[TokenId], &[TokenId])> = active
-            .iter()
+        let mut verify_reqs: Vec<(&[TokenId], &[TokenId], Option<&mut (dyn crate::constraints::CfgMatcher + '_)>)> = active
+            .iter_mut()
             .enumerate()
             .map(|(i, req)| {
-                (req.session.context(), drafted_tokens_storage[i].as_slice())
+                (req.session.context(), drafted_tokens_storage[i].as_slice(), None)
             })
             .collect();
 
-        let verify_results = target_model.verify_batch(&verify_reqs)?;
+        let verify_results = target_model.verify_batch(&mut verify_reqs)?;
 
         // 3. Commit and Send
         for (i, req) in active.iter_mut().enumerate() {
