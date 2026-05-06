@@ -40,13 +40,15 @@ serde = { version = "1.0.228", features = ["derive"] }
 clap = { version = "4.6.1", features = ["derive"] }
 anyhow = "1.0.102"
 futures = "0.3.32"
+rand = "0.9.0"
 
 # Optional web dependencies
 axum = { version = "0.8.9", optional = true }
 serde_json = { version = "1.0.149", optional = true }
+minijinja = { version = "2.1", optional = true }
 tower-http = { version = "0.6.8", features = ["cors", "fs", "trace"], optional = true }
 async-stream = { version = "0.3.6", optional = true }
 
 [features]
 default = ["serve"]
-serve = ["dep:axum", "dep:serde_json", "dep:tower-http", "dep:async-stream"]
+serve = ["dep:axum", "dep:serde_json", "dep:tower-http", "dep:async-stream", "dep:minijinja"]

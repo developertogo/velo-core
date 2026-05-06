@@ -155,63 +155,68 @@ kernel void softmax(
 
 // ── Attention Kernels ─────────────────────────────────────────────────────────
 
-kernel void attn_q_k(
-    device float* scores [[buffer(0)]],
+kernel void paged_attention_fused(
+    device float* out [[buffer(0)]],
     device const float* q [[buffer(1)]],
     device const float* k_cache [[buffer(2)]],
-    constant uint& head_dim [[buffer(3)]],
-    constant uint& n_ctx [[buffer(4)]],
-    constant uint& pos [[buffer(5)]],
-    constant uint& slot_id [[buffer(6)]],
-    device const uint* slot_mapping [[buffer(7)]],
-    constant uint& max_pages [[buffer(8)]],
-    constant uint& block_size [[buffer(9)]],
-    constant uint& n_head [[buffer(10)]],
+    device const float* v_cache [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& n_ctx [[buffer(5)]],
+    constant uint& pos [[buffer(6)]],
+    constant uint& slot_id [[buffer(7)]],
+    device const uint* slot_mapping [[buffer(8)]],
+    constant uint& max_pages [[buffer(9)]],
+    constant uint& block_size [[buffer(10)]],
+    constant uint& n_head_kv [[buffer(11)]],
     uint tpig [[thread_position_in_grid]] // thread per head
 ) {
     uint head_idx = tpig;
     device const float* head_q = q + head_idx * head_dim;
-    device float* head_scores = scores + head_idx * n_ctx;
+    device float* head_out = out + head_idx * head_dim;
 
+    // We'll use threadgroup memory for scores if possible, but n_ctx can be large.
+    // For now, we'll calculate scores on the fly or use a local array.
+    // Given MSL limits, we'll do a two-pass approach within the kernel if n_ctx is small,
+    // or just calculate on the fly for the second pass.
+    
     float inv_sqrt_head_dim = 1.0f / sqrt((float)head_dim);
+    float max_score = -INFINITY;
+    
+    // Pass 1: Scores + Max
+    // We'll use a fixed-size local buffer for scores to support reasonable context lengths.
+    // For very large contexts, we'd need a different approach.
+    float scores[1024]; // Support up to 1024 context in fused kernel for now
+    uint limit = min(pos + 1, 1024u);
 
-    for (uint t = 0; t <= pos; t++) {
+    for (uint t = 0; t < limit; t++) {
         float sum = 0.0f;
         uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
         uint token_in_block = t % block_size;
-        device const float* head_k = k_cache + (block_idx * block_size * n_head * head_dim) + (token_in_block * n_head * head_dim) + (head_idx * head_dim);
+        device const float* head_k = k_cache + (block_idx * block_size * n_head_kv * head_dim) + (token_in_block * n_head_kv * head_dim) + (head_idx * head_dim);
         for (uint d = 0; d < head_dim; d++) {
             sum += head_q[d] * head_k[d];
         }
-        head_scores[t] = sum * inv_sqrt_head_dim;
+        float score = sum * inv_sqrt_head_dim;
+        scores[t] = score;
+        max_score = max(max_score, score);
     }
-}
 
-kernel void attn_p_v(
-    device float* out [[buffer(0)]],
-    device const float* probs [[buffer(1)]],
-    device const float* v_cache [[buffer(2)]],
-    constant uint& head_dim [[buffer(3)]],
-    constant uint& n_ctx [[buffer(4)]],
-    constant uint& pos [[buffer(5)]],
-    constant uint& slot_id [[buffer(6)]],
-    device const uint* slot_mapping [[buffer(7)]],
-    constant uint& max_pages [[buffer(8)]],
-    constant uint& block_size [[buffer(9)]],
-    constant uint& n_head [[buffer(10)]],
-    uint tpig [[thread_position_in_grid]] // thread per head
-) {
-    uint head_idx = tpig;
-    device const float* head_probs = probs + head_idx * n_ctx;
-    device float* head_out = out + head_idx * head_dim;
+    // Softmax
+    float exp_sum = 0.0f;
+    for (uint t = 0; t < limit; t++) {
+        scores[t] = exp(scores[t] - max_score);
+        exp_sum += scores[t];
+    }
+    float inv_exp_sum = 1.0f / exp_sum;
 
+    // Pass 2: Accumulate Values
     for (uint d = 0; d < head_dim; d++) {
         float sum = 0.0f;
-        for (uint t = 0; t <= pos; t++) {
+        for (uint t = 0; t < limit; t++) {
             uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
             uint token_in_block = t % block_size;
-            device const float* head_v = v_cache + (block_idx * block_size * n_head * head_dim) + (token_in_block * n_head * head_dim) + (head_idx * head_dim);
-            sum += head_probs[t] * head_v[d];
+            device const float* head_v = v_cache + (block_idx * block_size * n_head_kv * head_dim) + (token_in_block * n_head_kv * head_dim) + (head_idx * head_dim);
+            sum += (scores[t] * inv_exp_sum) * head_v[d];
         }
         head_out[d] = sum;
     }
@@ -243,6 +248,125 @@ kernel void kv_update(
 
     k_cache[cache_offset] = k_in[in_offset];
     v_cache[cache_offset] = v_in[in_offset];
+}
+
+// ── Quantized Attention (INT8) ────────────────────────────────────────────────
+// Cache layout: [Block][Token][Head][Dim] where Dim is char[head_dim] + float scale
+
+kernel void paged_attention_fused_int8(
+    device float* out [[buffer(0)]],
+    device const float* q [[buffer(1)]],
+    device const char* k_cache [[buffer(2)]],
+    device const char* v_cache [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& n_ctx [[buffer(5)]],
+    constant uint& pos [[buffer(6)]],
+    constant uint& slot_id [[buffer(7)]],
+    device const uint* slot_mapping [[buffer(8)]],
+    constant uint& max_pages [[buffer(9)]],
+    constant uint& block_size [[buffer(10)]],
+    constant uint& n_head_kv [[buffer(11)]],
+    uint tpig [[thread_position_in_grid]]
+) {
+    uint head_idx = tpig;
+    device const float* head_q = q + head_idx * head_dim;
+    device float* head_out = out + head_idx * head_dim;
+
+    float inv_sqrt_head_dim = 1.0f / sqrt((float)head_dim);
+    float max_score = -INFINITY;
+    float scores[1024];
+    uint limit = min(pos + 1, 1024u);
+
+    // Byte size of one head in cache: head_dim bytes + 4 bytes scale
+    uint head_bytes = head_dim + 4;
+
+    for (uint t = 0; t < limit; t++) {
+        float sum = 0.0f;
+        uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
+        uint token_in_block = t % block_size;
+        
+        device const char* k_head_ptr = k_cache + (block_idx * block_size * n_head_kv * head_bytes) + (token_in_block * n_head_kv * head_bytes) + (head_idx * head_bytes);
+        float k_scale = *(device const float*)(k_head_ptr + head_dim);
+
+        for (uint d = 0; d < head_dim; d++) {
+            sum += head_q[d] * ((float)k_head_ptr[d] * k_scale);
+        }
+        float score = sum * inv_sqrt_head_dim;
+        scores[t] = score;
+        max_score = max(max_score, score);
+    }
+
+    float exp_sum = 0.0f;
+    for (uint t = 0; t < limit; t++) {
+        scores[t] = exp(scores[t] - max_score);
+        exp_sum += scores[t];
+    }
+    float inv_exp_sum = 1.0f / exp_sum;
+
+    for (uint d = 0; d < head_dim; d++) {
+        float sum = 0.0f;
+        for (uint t = 0; t < limit; t++) {
+            uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
+            uint token_in_block = t % block_size;
+            
+            device const char* v_head_ptr = v_cache + (block_idx * block_size * n_head_kv * head_bytes) + (token_in_block * n_head_kv * head_bytes) + (head_idx * head_bytes);
+            float v_scale = *(device const float*)(v_head_ptr + head_dim);
+            
+            sum += (scores[t] * inv_exp_sum) * ((float)v_head_ptr[d] * v_scale);
+        }
+        head_out[d] = sum;
+    }
+}
+
+kernel void kv_update_int8(
+    device char* k_cache [[buffer(0)]],
+    device char* v_cache [[buffer(1)]],
+    device const float* k_in [[buffer(2)]],
+    device const float* v_in [[buffer(3)]],
+    constant uint& slot_id [[buffer(4)]],
+    device const uint* slot_mapping [[buffer(5)]],
+    constant uint& max_pages [[buffer(6)]],
+    constant uint& block_size [[buffer(7)]],
+    constant uint& n_head [[buffer(8)]],
+    constant uint& head_dim [[buffer(9)]],
+    constant uint& pos [[buffer(10)]],
+    uint tpig [[thread_position_in_grid]] // thread per head
+) {
+    uint head_idx = tpig;
+    if (head_idx >= n_head) return;
+
+    uint block_idx = slot_mapping[slot_id * max_pages + (pos / block_size)];
+    uint token_in_block = pos % block_size;
+
+    uint head_bytes = head_dim + 4;
+    uint cache_offset = (block_idx * block_size * n_head * head_bytes) + (token_in_block * n_head * head_bytes) + (head_idx * head_bytes);
+    uint in_offset = head_idx * head_dim;
+
+    device char* k_dst = k_cache + cache_offset;
+    device char* v_dst = v_cache + cache_offset;
+    device const float* k_src = k_in + in_offset;
+    device const float* v_src = v_in + in_offset;
+
+    // Find scales
+    float k_max = 0.0f;
+    float v_max = 0.0f;
+    for (uint d = 0; d < head_dim; d++) {
+        k_max = max(k_max, abs(k_src[d]));
+        v_max = max(v_max, abs(v_src[d]));
+    }
+
+    float k_scale = k_max / 127.0f;
+    float v_scale = v_max / 127.0f;
+    float k_inv_scale = k_max > 0.0f ? 127.0f / k_max : 0.0f;
+    float v_inv_scale = v_max > 0.0f ? 127.0f / v_max : 0.0f;
+
+    for (uint d = 0; d < head_dim; d++) {
+        k_dst[d] = (char)(k_src[d] * k_inv_scale);
+        v_dst[d] = (char)(v_src[d] * v_inv_scale);
+    }
+
+    *(device float*)(k_dst + head_dim) = k_scale;
+    *(device float*)(v_dst + head_dim) = v_scale;
 }
 
 // ── Element-wise Addition ─────────────────────────────────────────────────────

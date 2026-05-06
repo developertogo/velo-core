@@ -5,12 +5,21 @@ use crate::radix_cache::KvCacheHandle;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default)]
+pub enum KvCacheType {
+    #[default]
+    Fp32,
+    Int8,
+    Fp8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PagedAttentionConfig {
     pub block_size: usize,
     pub page_tokens: usize,
     pub total_pages: usize,
     pub unified_memory: bool,
+    pub kv_type: KvCacheType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +59,13 @@ impl PagedAttentionConfig {
             page_tokens: block_size,
             total_pages,
             unified_memory: true,
+            kv_type: KvCacheType::Fp32,
         })
+    }
+
+    pub fn with_kv_type(mut self, kv_type: KvCacheType) -> Self {
+        self.kv_type = kv_type;
+        self
     }
 }
 

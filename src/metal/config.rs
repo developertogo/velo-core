@@ -1,5 +1,6 @@
 use crate::runtime::MemoryRuntimeConfig;
 use super::types::Quantization;
+use crate::paged_attention::KvCacheType;
 
 /// Configuration for the Metal backend.
 #[derive(Debug, Clone)]
@@ -14,6 +15,8 @@ pub struct MetalBackendConfig {
     pub paged_block_size: usize,
     /// Quantization format used by the weights.
     pub quantization: Quantization,
+    /// Type of KV cache quantization.
+    pub kv_type: KvCacheType,
 }
 
 impl Default for MetalBackendConfig {
@@ -24,6 +27,7 @@ impl Default for MetalBackendConfig {
             kv_bytes_per_token: 4,
             paged_block_size: 16,
             quantization: Quantization::Q4_0,
+            kv_type: KvCacheType::Fp32,
         }
     }
 }

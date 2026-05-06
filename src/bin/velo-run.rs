@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use velo_core::backend::{CausalLmBackend, GreedySampler, TokenLogits};
+use velo_core::{CausalLmBackend, GreedySampler, Sampler, TokenLogits};
 use velo_core::model_loader::load_gguf;
 use velo_core::llama_cpu::LlamaCpuModel;
 use velo_core::radix_cache::TokenId;
@@ -58,7 +58,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let ttft = t1.elapsed();
 
     let sampler = GreedySampler;
-    let first_tok = sampler.sample(&TokenLogits::new(prompt_logits).map_err(|e| format!("Invalid logits: {e}"))?);
+    let first_tok = sampler.sample(&prompt_logits);
 
     eprintln!(
         "TTFT: {:.1}ms  first token id: {} (confidence {:.4})",
@@ -75,7 +75,7 @@ fn run(args: &[String]) -> Result<(), String> {
     for _ in 0..max_new {
         let last = *generated.last().unwrap();
         let logits = model.next_logits(&[last]).map_err(|e| format!("Generation failed: {e}"))?;
-        let pred = sampler.sample(&logits);
+        let pred = sampler.sample(logits.values());
         generated.push(pred.token);
     }
     let gen_elapsed = t2.elapsed();
@@ -107,6 +107,7 @@ struct RunConfig {
     max_tokens: usize,
 }
 
+#[allow(dead_code)]
 const USAGE: &str = "\
 Usage: velo-run --model <path> --token-ids <id,id,...> [--max-tokens <n>]
        velo-run --model <path> --prompt <text>          [--max-tokens <n>]
@@ -175,6 +176,7 @@ fn parse_args(args: &[String]) -> Result<RunConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     fn args(pairs: &[&str]) -> Vec<String> {
         let mut v = vec!["velo-run".to_string()];
@@ -278,11 +280,10 @@ mod tests {
        
         let logits = model.forward_sequence(&prompt).unwrap();
         let sampler = GreedySampler;
-        let tok = sampler.sample(&TokenLogits::new(logits).unwrap());
-        assert!(tok.token < n_vocab as u32);
-       
+        let tok = sampler.sample(TokenLogits::new(logits).unwrap().values());
+        
         let next_logits = model.next_logits(&[tok.token]).unwrap();
-        let next_tok = sampler.sample(&next_logits);
+        let next_tok = sampler.sample(next_logits.values());
         assert!(next_tok.token < n_vocab as u32);
     }
 

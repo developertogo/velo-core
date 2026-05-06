@@ -10,6 +10,7 @@ use crate::model_loader::ModelMeta;
 use crate::radix_cache::TokenId;
 use crate::slot_manager::SlotId;
 use crate::speculative::{Result, SpeculativeError};
+use crate::paged_attention::KvCacheType;
 
 /// Native Metal inference model for LLaMA architecture.
 pub struct LlamaMetalModel {
@@ -45,7 +46,8 @@ impl LlamaMetalModel {
         let mut pipelines = HashMap::new();
         let functions = [
             "matvec_f32", "matvec_q4_0", "rms_norm", "rope", "silu", "vec_mul", "softmax",
-            "attn_q_k", "attn_p_v", "vec_add", "kv_update"
+            "vec_add", "kv_update", "paged_attention_fused",
+            "kv_update_int8", "paged_attention_fused_int8"
         ];
         for name in functions {
             if let Some(func) = library.newFunctionWithName(&objc2_foundation::NSString::from_str(name)) {
@@ -117,6 +119,7 @@ impl LlamaMetalModel {
         slot_mapping: &ProtocolObject<dyn MTLBuffer>,
         max_pages: usize,
         block_size: usize,
+        kv_type: KvCacheType,
     ) -> Result<Vec<f32>> {
         let n_embd = self.meta.n_embd;
         let n_layer = self.meta.n_layer;
@@ -190,98 +193,73 @@ impl LlamaMetalModel {
                 }
             }
 
-            let n_ctx = self.meta.n_ctx;
-            let layer_offset = (l * max_pages * block_size * n_head_kv * head_dim * std::mem::size_of::<f32>()) as _;
-
+            // ── KV Update ──
             {
                 let encoder = command_buffer.computeCommandEncoder().unwrap();
+                let kernel_name = match kv_type {
+                    KvCacheType::Fp32 => "kv_update",
+                    KvCacheType::Int8 | KvCacheType::Fp8 => "kv_update_int8",
+                };
+                let pipeline = self.pipelines.get(kernel_name).unwrap();
                 unsafe {
-                    encoder.setComputePipelineState(self.pipelines.get("kv_update").unwrap());
-                    encoder.setBuffer_offset_atIndex(Some(k_pool), layer_offset, 0);
-                    encoder.setBuffer_offset_atIndex(Some(v_pool), layer_offset, 1);
+                    encoder.setComputePipelineState(pipeline);
+                    encoder.setBuffer_offset_atIndex(Some(k_pool), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(v_pool), 0, 1);
                     encoder.setBuffer_offset_atIndex(Some(&k_buf), 0, 2);
                     encoder.setBuffer_offset_atIndex(Some(&v_buf), 0, 3);
-                    let slot_id_u32 = slot_id.0 as u32;
-                    let max_pages_u32 = max_pages as u32;
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&slot_id_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
+                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&slot_id as *const SlotId as *mut _).unwrap(), std::mem::size_of::<SlotId>() as _, 4);
                     encoder.setBuffer_offset_atIndex(Some(slot_mapping), 0, 5);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&max_pages_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 6);
+                    let max_pages_u32 = max_pages as u32;
                     let block_size_u32 = block_size as u32;
                     let n_head_kv_u32 = n_head_kv as u32;
                     let head_dim_u32 = head_dim as u32;
                     let pos_u32 = pos as u32;
+                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&max_pages_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 6);
                     encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&block_size_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 7);
                     encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_head_kv_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 8);
                     encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&head_dim_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 9);
                     encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&pos_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 10);
-                    encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: (n_head_kv * head_dim) as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
+                    
+                    let grid_size = if kv_type == KvCacheType::Fp32 {
+                        MTLSize { width: (n_head_kv * head_dim) as _, height: 1, depth: 1 }
+                    } else {
+                        MTLSize { width: n_head_kv as _, height: 1, depth: 1 }
+                    };
+                    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, MTLSize { width: 1, height: 1, depth: 1 });
                     encoder.endEncoding();
                 }
             }
-
-            let attn_scores = self.get_scratch("attn_scores", n_head * n_ctx * std::mem::size_of::<f32>());
-            {
-                let encoder = command_buffer.computeCommandEncoder().unwrap();
-                unsafe {
-                    encoder.setComputePipelineState(self.pipelines.get("attn_q_k").unwrap());
-                    encoder.setBuffer_offset_atIndex(Some(&attn_scores), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(k_pool), layer_offset, 2);
-                    let head_dim_u32 = head_dim as u32;
-                    let n_ctx_u32 = n_ctx as u32;
-                    let pos_u32 = pos as u32;
-                    let block_size_u32 = block_size as u32;
-                    let n_head_kv_u32 = n_head_kv as u32;
-                    let slot_id_u32 = slot_id.0 as u32;
-                    let max_pages_u32 = max_pages as u32;
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&head_dim_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 3);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_ctx_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&pos_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 5);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&slot_id_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 6);
-                    encoder.setBuffer_offset_atIndex(Some(slot_mapping), 0, 7);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&max_pages_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 8);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&block_size_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 9);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_head_kv_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 10);
-                    encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n_head as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
-                    encoder.endEncoding();
-                }
-            }
-
-            {
-                let encoder = command_buffer.computeCommandEncoder().unwrap();
-                unsafe {
-                    encoder.setComputePipelineState(self.pipelines.get("softmax").unwrap());
-                    encoder.setBuffer_offset_atIndex(Some(&attn_scores), 0, 0);
-                    let n_scores_u32 = (pos + 1) as u32;
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_scores_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 1);
-                    encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n_head as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
-                    encoder.endEncoding();
-                }
-            }
-
             let attn_out = self.get_scratch("attn_out", n_head * head_dim * std::mem::size_of::<f32>());
+
+            // ── Paged Attention ──
             {
                 let encoder = command_buffer.computeCommandEncoder().unwrap();
+                let kernel_name = match kv_type {
+                    KvCacheType::Fp32 => "paged_attention_fused",
+                    KvCacheType::Int8 | KvCacheType::Fp8 => "paged_attention_fused_int8",
+                };
+                let pipeline = self.pipelines.get(kernel_name).unwrap();
                 unsafe {
-                    encoder.setComputePipelineState(self.pipelines.get("attn_p_v").unwrap());
+                    encoder.setComputePipelineState(pipeline);
                     encoder.setBuffer_offset_atIndex(Some(&attn_out), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&attn_scores), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(v_pool), layer_offset, 2);
+                    encoder.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(k_pool), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(v_pool), 0, 3);
                     let head_dim_u32 = head_dim as u32;
-                    let n_ctx_u32 = n_ctx as u32;
+                    let n_ctx_u32 = (pos + 1) as u32;
                     let pos_u32 = pos as u32;
+                    let max_pages_u32 = max_pages as u32;
                     let block_size_u32 = block_size as u32;
                     let n_head_kv_u32 = n_head_kv as u32;
-                    let slot_id_u32 = slot_id.0 as u32;
-                    let max_pages_u32 = max_pages as u32;
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&head_dim_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 3);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_ctx_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&pos_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 5);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&slot_id_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 6);
-                    encoder.setBuffer_offset_atIndex(Some(slot_mapping), 0, 7);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&max_pages_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 8);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&block_size_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 9);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_head_kv_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 10);
+                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&head_dim_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
+                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_ctx_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 5);
+                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&pos_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 6);
+                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&slot_id as *const SlotId as *mut _).unwrap(), std::mem::size_of::<SlotId>() as _, 7);
+                    encoder.setBuffer_offset_atIndex(Some(slot_mapping), 0, 8);
+                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&max_pages_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 9);
+                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&block_size_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 10);
+                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_head_kv_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 11);
+                    
                     encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n_head as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
                     encoder.endEncoding();
                 }

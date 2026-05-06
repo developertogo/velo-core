@@ -253,6 +253,10 @@ impl MemoryRuntime for MetalMemoryRuntime {
        
         Ok(())
     }
+
+    fn metal_handles(&self) -> Option<crate::metal::runtime::MetalRuntimeHandles> {
+        Some(self.context.handles.clone())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

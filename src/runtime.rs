@@ -1,6 +1,7 @@
 use crate::kv_store::{InMemoryKvStore, KvStore, KvStoreError};
 use crate::paged_attention::{
     BlockMapping, PageManagerError, PageSpan, PagedAttentionBlockManager, PagedAttentionConfig,
+    KvCacheType,
 };
 use crate::radix_cache::KvCacheHandle;
 
@@ -33,6 +34,11 @@ pub trait MemoryRuntime {
     /// This allows the backend to update its persistent page table for the given
     /// slot, enabling O(1) lookups during kernel execution.
     fn bind_slot(&mut self, slot: crate::slot_manager::SlotId, pages: &[u32]) -> Result<(), crate::speculative::SpeculativeError>;
+
+    /// Returns Metal hardware handles if this is a Metal-backed runtime.
+    fn metal_handles(&self) -> Option<crate::metal::runtime::MetalRuntimeHandles> {
+        None
+    }
 }
 
 /// Configuration for the memory runtime and KV-cache layout.
@@ -50,6 +56,8 @@ pub struct MemoryRuntimeConfig {
     pub unified_memory: bool,
     /// Maximum number of concurrent request slots to support.
     pub max_slots: usize,
+    /// Type of KV cache quantization.
+    pub kv_type: KvCacheType,
 }
 
 impl MemoryRuntimeConfig {
@@ -62,7 +70,13 @@ impl MemoryRuntimeConfig {
             n_layer,
             unified_memory: true,
             max_slots,
+            kv_type: KvCacheType::Fp32,
         }
+    }
+
+    pub fn with_kv_type(mut self, kv_type: KvCacheType) -> Self {
+        self.kv_type = kv_type;
+        self
     }
 
     /// Creates a configuration optimized for CPU execution.
@@ -86,7 +100,7 @@ impl CpuMemoryRuntime {
             allocator: PagedAttentionBlockManager::new(PagedAttentionConfig::new(
                 config.paged_block_size,
                 config.paged_total_pages,
-            )?),
+            )?.with_kv_type(config.kv_type)),
         })
     }
 }

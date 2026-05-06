@@ -73,6 +73,9 @@ pub struct BenchmarkRow {
     pub avg_target_calls: f64,
     pub avg_accepted_tokens: f64,
     pub avg_rejected_tokens: f64,
+    pub p50_ns: f64,
+    pub p90_ns: f64,
+    pub p99_ns: f64,
     pub baseline_avg_ts: Option<f64>,
     pub speedup_vs_baseline: Option<f64>,
 }
@@ -351,6 +354,9 @@ fn summarize(config: &BenchmarkConfig, samples: &[BenchmarkSample]) -> Benchmark
                 .map(|s| s.speculative.rejected_tokens as f64)
                 .collect::<Vec<_>>(),
         ),
+        p50_ns: percentile(&elapsed_ns, 50.0),
+        p90_ns: percentile(&elapsed_ns, 90.0),
+        p99_ns: percentile(&elapsed_ns, 99.0),
         baseline_avg_ts: None,
         speedup_vs_baseline: None,
     }
@@ -529,6 +535,16 @@ fn stddev(values: &[f64]) -> f64 {
     variance.sqrt()
 }
 
+fn percentile(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let idx = (p / 100.0 * (sorted.len() - 1) as f64).round() as usize;
+    sorted[idx]
+}
+
 impl std::fmt::Display for BenchmarkMode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -553,9 +569,9 @@ impl BenchmarkReport {
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
         out.push_str(
-            "| test | model | backend | t/s | ttft ns | cache hit | cache miss | speedup |\n",
+            "| test | model | backend | t/s | ttft ns | p50 ns | p90 ns | cache hit | speedup |\n",
         );
-        out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
+        out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
         for row in &self.rows {
             let ttft = row
                 .avg_ttft_ns
@@ -566,14 +582,15 @@ impl BenchmarkReport {
                 .map(|value| format!("{value:.2}x"))
                 .unwrap_or_else(|| "-".to_string());
             out.push_str(&format!(
-                "| {} | {} | {} | {:.2} | {} | {:.2} | {:.2} | {} |\n",
+                "| {} | {} | {} | {:.2} | {} | {:.0} | {:.0} | {:.2} | {} |\n",
                 row.test,
                 row.model_name,
                 row.backend_name,
                 row.avg_ts,
                 ttft,
+                row.p50_ns,
+                row.p90_ns,
                 row.avg_cache_hit_tokens,
-                row.avg_cache_miss_tokens,
                 speedup
             ));
         }
@@ -582,7 +599,7 @@ impl BenchmarkReport {
 
     pub fn to_csv(&self) -> String {
         let mut out = String::new();
-        out.push_str("model_name,backend_name,test,mode,prompt_len,gen_len,cached_depth,repetitions,warmups,avg_ns,stddev_ns,avg_ts,stddev_ts,avg_ttft_ns,avg_cache_hit_tokens,avg_cache_miss_tokens,avg_draft_calls,avg_target_calls,avg_accepted_tokens,avg_rejected_tokens,baseline_avg_ts,speedup_vs_baseline\n");
+        out.push_str("model_name,backend_name,test,mode,prompt_len,gen_len,cached_depth,repetitions,warmups,avg_ns,stddev_ns,p50_ns,p90_ns,p99_ns,avg_ts,stddev_ts,avg_ttft_ns,avg_cache_hit_tokens,avg_cache_miss_tokens,avg_draft_calls,avg_target_calls,avg_accepted_tokens,avg_rejected_tokens,baseline_avg_ts,speedup_vs_baseline\n");
         for row in &self.rows {
             let ttft = row
                 .avg_ttft_ns
@@ -594,7 +611,7 @@ impl BenchmarkReport {
                 .speedup_vs_baseline
                 .map_or(String::new(), |value| value.to_string());
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{:.0},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{:.0},{:.6},{:.0},{:.0},{:.0},{:.6},{:.6},{},{},{},{},{},{},{},{},{}\n",
                 row.model_name,
                 row.backend_name,
                 row.test,
@@ -606,6 +623,9 @@ impl BenchmarkReport {
                 row.warmups,
                 row.avg_ns,
                 row.stddev_ns,
+                row.p50_ns,
+                row.p90_ns,
+                row.p99_ns,
                 row.avg_ts,
                 row.stddev_ts,
                 ttft,
@@ -629,7 +649,7 @@ impl BenchmarkReport {
                 out.push(',');
             }
             out.push_str(&format!(
-                "{{\"model_name\":\"{}\",\"backend_name\":\"{}\",\"test\":\"{}\",\"mode\":\"{}\",\"prompt_len\":{},\"gen_len\":{},\"cached_depth\":{},\"repetitions\":{},\"warmups\":{},\"avg_ns\":{:.0},\"stddev_ns\":{:.6},\"avg_ts\":{:.6},\"stddev_ts\":{:.6},\"avg_ttft_ns\":{},\"avg_cache_hit_tokens\":{:.6},\"avg_cache_miss_tokens\":{:.6},\"avg_draft_calls\":{:.6},\"avg_target_calls\":{:.6},\"avg_accepted_tokens\":{:.6},\"avg_rejected_tokens\":{:.6},\"baseline_avg_ts\":{},\"speedup_vs_baseline\":{}}}",
+                "{{\"model_name\":\"{}\",\"backend_name\":\"{}\",\"test\":\"{}\",\"mode\":\"{}\",\"prompt_len\":{},\"gen_len\":{},\"cached_depth\":{},\"repetitions\":{},\"warmups\":{},\"avg_ns\":{:.0},\"stddev_ns\":{:.6},\"p50_ns\":{:.0},\"p90_ns\":{:.0},\"p99_ns\":{:.0},\"avg_ts\":{:.6},\"stddev_ts\":{:.6},\"avg_ttft_ns\":{},\"avg_cache_hit_tokens\":{:.6},\"avg_cache_miss_tokens\":{:.6},\"avg_draft_calls\":{:.6},\"avg_target_calls\":{:.6},\"avg_accepted_tokens\":{:.6},\"avg_rejected_tokens\":{:.6},\"baseline_avg_ts\":{},\"speedup_vs_baseline\":{}}}",
                 row.model_name,
                 row.backend_name,
                 row.test,
@@ -641,6 +661,9 @@ impl BenchmarkReport {
                 row.warmups,
                 row.avg_ns,
                 row.stddev_ns,
+                row.p50_ns,
+                row.p90_ns,
+                row.p99_ns,
                 row.avg_ts,
                 row.stddev_ts,
                 row.avg_ttft_ns.map_or_else(|| "null".to_string(), |value| value.to_string()),
@@ -707,6 +730,9 @@ mod tests {
             avg_target_calls: 1.0,
             avg_accepted_tokens: 1.0,
             avg_rejected_tokens: 0.0,
+            p50_ns: 1000.0,
+            p90_ns: 1000.0,
+            p99_ns: 1000.0,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
         };
@@ -739,6 +765,9 @@ mod tests {
             avg_target_calls: 1.0,
             avg_accepted_tokens: 1.0,
             avg_rejected_tokens: 0.0,
+            p50_ns: 1000.0,
+            p90_ns: 1000.0,
+            p99_ns: 1000.0,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
         };
@@ -758,6 +787,14 @@ mod tests {
             format_mode(BenchmarkMode::PromptPlusGeneration, 512, 128, 64),
             "pp512+tg128 @ d64"
         );
+    }
+
+    #[test]
+    fn calculates_percentiles() {
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(percentile(&values, 50.0), 3.0);
+        assert_eq!(percentile(&values, 0.0), 1.0);
+        assert_eq!(percentile(&values, 100.0), 5.0);
     }
 
     #[test]
@@ -783,6 +820,9 @@ mod tests {
             avg_target_calls: 0.0,
             avg_accepted_tokens: 0.0,
             avg_rejected_tokens: 0.0,
+            p50_ns: 1000.0,
+            p90_ns: 1000.0,
+            p99_ns: 1000.0,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
         }];
@@ -800,6 +840,7 @@ mod tests {
         let engine_config = crate::engine::EngineConfig {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+            kv_type: crate::paged_attention::KvCacheType::Fp32,
         };
 
         let config = BenchmarkConfig {
@@ -846,6 +887,9 @@ mod tests {
             avg_target_calls: 0.0,
             avg_accepted_tokens: 0.0,
             avg_rejected_tokens: 0.0,
+            p50_ns: 1000.0,
+            p90_ns: 1000.0,
+            p99_ns: 1000.0,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
         };
@@ -879,6 +923,9 @@ mod tests {
             avg_target_calls: 1.0,
             avg_accepted_tokens: 1.0,
             avg_rejected_tokens: 0.0,
+            p50_ns: 1000.0,
+            p90_ns: 1000.0,
+            p99_ns: 1000.0,
             baseline_avg_ts: Some(800.0),
             speedup_vs_baseline: Some(1.25),
         };
@@ -932,6 +979,7 @@ mod tests {
         let engine_config = crate::engine::EngineConfig {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+            kv_type: crate::paged_attention::KvCacheType::Fp32,
         };
         let config = BenchmarkConfig {
             mode: BenchmarkMode::PromptProcessing,
@@ -958,6 +1006,7 @@ mod tests {
         let engine_config = crate::engine::EngineConfig {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+            kv_type: crate::paged_attention::KvCacheType::Fp32,
         };
 
         let config = BenchmarkConfig {
@@ -986,6 +1035,7 @@ mod tests {
         let engine_config = crate::engine::EngineConfig {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+            kv_type: crate::paged_attention::KvCacheType::Fp32,
         };
 
         let config = BenchmarkConfig {
@@ -1058,6 +1108,9 @@ mod tests {
             avg_target_calls: 0.0,
             avg_accepted_tokens: 0.0,
             avg_rejected_tokens: 0.0,
+            p50_ns: 100.0,
+            p90_ns: 100.0,
+            p99_ns: 100.0,
             baseline_avg_ts: Some(5.0),
             speedup_vs_baseline: Some(2.0),
         };

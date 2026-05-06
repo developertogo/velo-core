@@ -1,5 +1,5 @@
 use crate::kv_store::KvStoreError;
-use crate::paged_attention::{PageManagerError, PageSpan};
+use crate::paged_attention::{PageManagerError, PageSpan, KvCacheType};
 use crate::radix_cache::{CacheLookup, KvCacheHandle, RadixCache, TokenId};
 use crate::runtime::{
     CpuMemoryRuntime, KvBlockStore, MemoryRuntime, MemoryRuntimeConfig, PagedBlockAllocator,
@@ -29,6 +29,17 @@ pub struct VeloEngine<R = CpuMemoryRuntime> {
 pub struct EngineConfig {
     pub draft_window: usize,
     pub memory: MemoryRuntimeConfig,
+    pub kv_type: KvCacheType,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            draft_window: 8,
+            memory: MemoryRuntimeConfig::default(),
+            kv_type: KvCacheType::Fp32,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,6 +411,8 @@ impl VeloEngine<CpuMemoryRuntime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::radix_cache::KvCacheHandle;
+    use crate::paged_attention::KvCacheType;
     use crate::kv_store::KvStore;
     use crate::metal::Quantization;
     use crate::{MetalMemoryRuntime, MetalRuntimeConfig};
@@ -477,6 +490,7 @@ mod tests {
         let mut engine = VeloEngine::new(EngineConfig {
             draft_window: 4,
             memory: MemoryRuntimeConfig::cpu(128, 16, 32, 32, 32),
+            kv_type: KvCacheType::Fp32,
         })
         .unwrap();
         let prompt = [10, 20];
@@ -517,6 +531,7 @@ mod tests {
         let mut engine = VeloEngine::new(EngineConfig {
             draft_window: 2,
             memory: MemoryRuntimeConfig::cpu(128, 16, 32, 32, 32),
+            kv_type: KvCacheType::Fp32,
         })
         .unwrap();
         let mut draft = ScriptedDraft {
@@ -558,6 +573,7 @@ mod tests {
         let mut engine = VeloEngine::new(EngineConfig {
             draft_window: 2,
             memory: MemoryRuntimeConfig::cpu(32, 8, 16, 32, 32),
+            kv_type: KvCacheType::Fp32,
         })
         .unwrap();
         let mut draft = ScriptedDraft {
@@ -596,6 +612,7 @@ mod tests {
         let mut engine = VeloEngine::new(EngineConfig {
             draft_window: 2,
             memory: MemoryRuntimeConfig::cpu(16, 8, 16, 32, 32),
+            kv_type: KvCacheType::Fp32,
         })
         .unwrap();
         let mut draft = ScriptedDraft {
@@ -648,6 +665,7 @@ mod tests {
             EngineConfig {
                 draft_window: 2,
                 memory: runtime.context().memory,
+                kv_type: KvCacheType::Fp32,
             },
             runtime,
         )
@@ -677,6 +695,7 @@ mod tests {
         let config = EngineConfig {
             draft_window: 4,
             memory: MemoryRuntimeConfig::cpu(128, 16, 32, 1, 1), // Only 1 slot
+            kv_type: KvCacheType::Fp32,
         };
         let mut engine = VeloEngine::new(config).unwrap();
         let mut draft = ScriptedDraft {
@@ -704,6 +723,7 @@ mod tests {
         let config = EngineConfig {
             draft_window: 2,
             memory: MemoryRuntimeConfig::cpu(1024, 16, 32, 4, 4), // 4 slots
+            kv_type: KvCacheType::Fp32,
         };
         let mut engine = VeloEngine::new(config).unwrap();
 
@@ -748,6 +768,7 @@ mod tests {
         let config = EngineConfig {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(1024, 16, 32, 4, 4),
+            kv_type: KvCacheType::Fp32,
         };
         let mut engine = VeloEngine::new(config).unwrap();
 
@@ -786,6 +807,7 @@ mod tests {
         let config = EngineConfig {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(1024, 16, 32, 1, 1), // Only 1 slot
+            kv_type: KvCacheType::Fp32,
         };
         let mut engine = VeloEngine::new(config).unwrap();
         let mut draft = ScriptedDraft {
@@ -826,6 +848,7 @@ mod tests {
         let mut engine = VeloEngine::new(EngineConfig {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+            kv_type: KvCacheType::Fp32,
         }).unwrap();
        
         assert_eq!(engine.cache().len(), 0);
@@ -840,6 +863,7 @@ mod tests {
         let mut engine = VeloEngine::new(EngineConfig {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+            kv_type: KvCacheType::Fp32,
         }).unwrap();
         let prefill = engine.prefill(&[]).unwrap();
         assert_eq!(prefill.stats.cache_hit_tokens, 0);
@@ -851,6 +875,7 @@ mod tests {
         let mut engine = VeloEngine::new(EngineConfig {
             draft_window: 1,
             memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+            kv_type: KvCacheType::Fp32,
         }).unwrap();
         let mut draft = ScriptedDraft { script: vec![1, 2], bound_prefixes: vec![], bound_slots: vec![] };
         let mut target = ScriptedTarget { script: vec![1, 2], bound_prefixes: vec![], bound_slots: vec![] };

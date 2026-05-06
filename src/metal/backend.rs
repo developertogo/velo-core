@@ -100,6 +100,16 @@ impl MetalBackend {
        
         Ok(())
     }
+
+    /// Swaps the underlying model with a new one from the pool.
+    /// This is used for zero-latency model switching.
+    pub fn switch_model(&mut self, name: &str, pool: &crate::model_pool::ModelPool) -> Result<()> {
+        let model = pool.get(name).ok_or_else(|| {
+            SpeculativeError::Model(format!("Model {} not found in pool", name))
+        })?;
+        self.model = Some(model);
+        Ok(())
+    }
 }
 
 impl CausalLmBackend for MetalBackend {
@@ -155,6 +165,7 @@ impl CausalLmBackend for MetalBackend {
             self.slot_mapping.as_ref().ok_or_else(|| SpeculativeError::Model("Slot mapping not wired".into()))?,
             allocator.config().total_pages,
             self.config.paged_block_size,
+            self.config.kv_type,
         )?;
         TokenLogits::new(logits)
     }
@@ -208,6 +219,7 @@ impl CausalLmBackend for MetalBackend {
                 slot_mapping,
                 max_pages,
                 self.config.paged_block_size,
+                self.config.kv_type,
             )?;
             result.push(TokenLogits::new(logits)?);
             current_pos += 1;

@@ -6,6 +6,7 @@ use crate::gguf::GgufFile;
 pub struct Tokenizer {
     tokens: Vec<String>,
     token_to_id: HashMap<String, u32>,
+    pub chat_template: Option<String>,
 }
 
 impl Tokenizer {
@@ -24,7 +25,11 @@ impl Tokenizer {
             }
         }
 
-        Self { tokens, token_to_id }
+        let chat_template = file.metadata.get("tokenizer.chat_template")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Self { tokens, token_to_id, chat_template }
     }
 
     /// Encodes a string into a sequence of token IDs using naive greedy longest-match.
@@ -67,6 +72,22 @@ impl Tokenizer {
         // Clean up common GGUF token artifacts like " " or "<0x0A>"
         result.replace(" ", " ")
     }
+
+    #[cfg(feature = "serve")]
+    pub fn apply_chat_template(&self, messages: &[serde_json::Value], add_generation_prompt: bool) -> Result<String, String> {
+        let template_str = self.chat_template.as_deref().unwrap_or(
+            "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+        );
+
+        let mut env = minijinja::Environment::new();
+        env.add_template("chat", template_str).map_err(|e| e.to_string())?;
+        let template = env.get_template("chat").map_err(|e| e.to_string())?;
+        
+        template.render(minijinja::context! {
+            messages => messages,
+            add_generation_prompt => add_generation_prompt,
+        }).map_err(|e| e.to_string())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -86,7 +107,11 @@ mod tests {
             token_to_id.insert(s.to_string(), i as u32);
         }
        
-        Tokenizer { tokens, token_to_id }
+        Tokenizer {
+            tokens,
+            token_to_id,
+            chat_template: None,
+        }
     }
 
     #[test]

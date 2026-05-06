@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use velo_core::backend::{GreedyDraftModel, GreedyTargetModel};
 use velo_core::mock_backend::MockBackend;
+
 use velo_core::engine::{EngineConfig, VeloEngine};
 use velo_core::model_loader::load_gguf;
 use velo_core::metal::{MetalBackend, MetalBackendConfig, MetalMemoryRuntime, MetalRuntimeConfig};
@@ -61,7 +62,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // Initialize Metal Runtimes
     let target_runtime = MetalMemoryRuntime::new(MetalRuntimeConfig {
         model_name: "target".to_string(),
-        memory: MemoryRuntimeConfig::cpu(kv_bytes_per_token, 16, 256, target_meta.n_layer, 32),
+        memory: MemoryRuntimeConfig::cpu(kv_bytes_per_token, 16, 256, target_meta.n_layer, 32).with_kv_type(velo_core::paged_attention::KvCacheType::Fp32),
         quantization: target_meta.quantization,
     }).map_err(|e| format!("Failed to create runtime: {e}"))?;
 
@@ -71,7 +72,8 @@ fn run(args: &[String]) -> Result<(), String> {
         kv_bytes_per_token,
         paged_block_size: 16,
         quantization: target_meta.quantization,
-    }).map_err(|e| format!("Failed to create target backend: {e}"))?;
+        kv_type: velo_core::paged_attention::KvCacheType::Fp32,
+        }).map_err(|e| format!("Failed to create target backend: {e}"))?;
     target_backend.wire(target_weights, &target_runtime).map_err(|e| format!("Failed to wire target: {e}"))?;
 
     let mut draft_backend = MetalBackend::new(MetalBackendConfig {
@@ -80,7 +82,8 @@ fn run(args: &[String]) -> Result<(), String> {
         kv_bytes_per_token,
         paged_block_size: 16,
         quantization: draft_weights.meta.quantization,
-    }).map_err(|e| format!("Failed to create draft backend: {e}"))?;
+        kv_type: velo_core::paged_attention::KvCacheType::Fp32,
+        }).map_err(|e| format!("Failed to create draft backend: {e}"))?;
    
     // For simplicity, we reuse the target runtime's context if they are both unified
     draft_backend.wire(draft_weights, &target_runtime).map_err(|e| format!("Failed to wire draft: {e}"))?;
@@ -89,6 +92,7 @@ fn run(args: &[String]) -> Result<(), String> {
         EngineConfig {
             draft_window: config.draft_window,
             memory: target_runtime.context().memory,
+            kv_type: velo_core::paged_attention::KvCacheType::Fp32,
         },
         target_runtime,
     ).map_err(|e| format!("Failed to create engine: {e}"))?;
@@ -129,7 +133,8 @@ fn run_mock(config: SpecConfig) {
     let script = (0..2048).collect::<Vec<TokenId>>();
     let mut engine = VeloEngine::new(EngineConfig {
         draft_window: config.draft_window,
-        memory: MemoryRuntimeConfig::cpu(4096, 16, 4096, 32, 32),
+        memory: MemoryRuntimeConfig::cpu(4096, 16, 4096, 32, 32).with_kv_type(velo_core::paged_attention::KvCacheType::Fp32),
+        kv_type: velo_core::paged_attention::KvCacheType::Fp32,
     }).unwrap();
 
     let draft_backend = MockBackend::new(script.clone());
@@ -169,6 +174,7 @@ struct SpecConfig {
     mock: bool,
 }
 
+#[allow(dead_code)]
 const USAGE: &str = "\
 Usage: velo-spec [--target <path> --draft <path> | --mock] --prompt <text> [--max-new <n>] [--window <w>]
 ";

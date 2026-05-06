@@ -15,13 +15,17 @@ pub mod slot_manager;
 pub mod speculative;
 pub mod scheduler;
 pub mod tokenizer;
+pub mod sampling;
+pub mod model_pool;
 
 pub use benchmark::{
     compare_with_llama_csv, load_llama_csv, parse_llama_csv, BenchmarkConfig, BenchmarkFormat,
     BenchmarkMode, BenchmarkReport, BenchmarkRow, BenchmarkSample, LlamaBenchRow,
     run_benchmark, run_single_case,
 };
-pub use backend::{CausalLmBackend, GreedyDraftModel, GreedySampler, GreedyTargetModel, TokenLogits};
+pub use backend::{CausalLmBackend, GreedyDraftModel, GreedyTargetModel, TokenLogits};
+pub use sampling::{GreedySampler, Sampler, TopPSampler, MinPSampler};
+pub use model_pool::ModelPool;
 pub use engine::{
     EngineConfig, EngineError, EngineOutput, EnginePrefillOutput, EngineStats, VeloEngine,
 };

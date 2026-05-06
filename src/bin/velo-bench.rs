@@ -1,13 +1,18 @@
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
-
 use velo_core::{
-    compare_with_llama_csv, load_llama_csv, run_benchmark, BenchmarkConfig, BenchmarkFormat,
+    compare_with_llama_csv,
+    load_llama_csv,
+    run_benchmark,
+    BenchmarkConfig,
+    BenchmarkFormat,
     BenchmarkMode,
+    EngineConfig,
+    MemoryRuntimeConfig,
 };
+
 use velo_core::metal::Quantization;
-use velo_core::{EngineConfig, MemoryRuntimeConfig};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = CliArgs::parse(env::args().skip(1))?;
@@ -54,6 +59,7 @@ struct CliArgs {
     quantization: Quantization,
     format: BenchmarkFormat,
     llama_csv: Option<PathBuf>,
+    kv_type: velo_core::paged_attention::KvCacheType,
 }
 
 impl CliArgs {
@@ -73,6 +79,7 @@ impl CliArgs {
         let mut quantization = Quantization::Q4_0;
         let mut format = BenchmarkFormat::Markdown;
         let mut llama_csv = None;
+        let mut kv_type = velo_core::paged_attention::KvCacheType::Fp32;
 
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
@@ -100,6 +107,15 @@ impl CliArgs {
                 }
                 "--llama-csv" => {
                     llama_csv = Some(PathBuf::from(take_value(&mut args, "--llama-csv")?));
+                }
+                "--kv-type" => {
+                    let value = take_value(&mut args, "--kv-type")?;
+                    kv_type = match value.as_str() {
+                        "fp32" => velo_core::paged_attention::KvCacheType::Fp32,
+                        "int8" => velo_core::paged_attention::KvCacheType::Int8,
+                        "fp8" => velo_core::paged_attention::KvCacheType::Fp8,
+                        _ => return Err(format!("unknown kv-type: {value}")),
+                    };
                 }
                 "--quantization" => {
                     let value = take_value(&mut args, "--quantization")?;
@@ -130,6 +146,7 @@ impl CliArgs {
             quantization,
             format,
             llama_csv,
+            kv_type,
         })
     }
 
@@ -178,6 +195,7 @@ impl CliArgs {
         EngineConfig {
             draft_window: self.draft_window,
             memory: MemoryRuntimeConfig::cpu(self.bytes_per_token, self.page_tokens, self.total_pages, 32, 32),
+            kv_type: self.kv_type,
         }
     }
 
@@ -281,6 +299,7 @@ mod tests {
             quantization: Quantization::Q4_0,
             format: BenchmarkFormat::Markdown,
             llama_csv: None,
+            kv_type: velo_core::paged_attention::KvCacheType::Fp32,
         };
         let modes = args.modes();
         assert_eq!(modes.len(), 3);
@@ -305,6 +324,7 @@ mod tests {
             quantization: Quantization::Q4_0,
             format: BenchmarkFormat::Markdown,
             llama_csv: None,
+            kv_type: velo_core::paged_attention::KvCacheType::Fp32,
         };
         let cfg = args.benchmark_config(BenchmarkMode::PromptProcessing);
         assert_eq!(cfg.prompt_len, 128);
