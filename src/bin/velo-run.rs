@@ -275,12 +275,12 @@ mod tests {
         let weights = velo_core::model_loader::WeightStore::dummy_llama(n_vocab, n_embd, 1);
         let mut model = LlamaCpuModel::new(weights);
         let prompt = vec![1, 2, 3];
-        
+       
         let logits = model.forward_sequence(&prompt).unwrap();
         let sampler = GreedySampler;
         let tok = sampler.sample(&TokenLogits::new(logits).unwrap());
         assert!(tok.token < n_vocab as u32);
-        
+       
         let next_logits = model.next_logits(&[tok.token]).unwrap();
         let next_tok = sampler.sample(&next_logits);
         assert!(next_tok.token < n_vocab as u32);
@@ -307,10 +307,10 @@ mod tests {
     fn test_parse_args_exhaustive() {
         // Test unknown argument
         assert!(parse_args(&["velo-run".to_string(), "--unknown".to_string()]).is_err());
-        
+       
         // Test missing required model
         assert_eq!(parse_args(&["velo-run".to_string(), "--token-ids".to_string(), "1".to_string()]).unwrap_err(), "--model is required");
-        
+       
         // Test missing prompt/token-ids
         assert_eq!(parse_args(&["velo-run".to_string(), "--model".to_string(), "m".to_string()]).unwrap_err(), "at least one of --token-ids or --prompt is required");
     }

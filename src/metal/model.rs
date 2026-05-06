@@ -21,6 +21,9 @@ pub struct LlamaMetalModel {
     pub scratch_buffers: HashMap<String, Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
+unsafe impl Send for LlamaMetalModel {}
+unsafe impl Sync for LlamaMetalModel {}
+
 impl std::fmt::Debug for LlamaMetalModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlamaMetalModel")
@@ -32,6 +35,7 @@ impl std::fmt::Debug for LlamaMetalModel {
 }
 
 impl LlamaMetalModel {
+    /// Creates a new LlamaMetalModel with the specified hardware handles.
     pub fn new(
         meta: ModelMeta,
         device: Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>,
@@ -40,7 +44,7 @@ impl LlamaMetalModel {
     ) -> Self {
         let mut pipelines = HashMap::new();
         let functions = [
-            "matvec_f32", "rms_norm", "rope", "silu", "vec_mul", "softmax",
+            "matvec_f32", "matvec_q4_0", "rms_norm", "rope", "silu", "vec_mul", "softmax",
             "attn_q_k", "attn_p_v", "vec_add", "kv_update"
         ];
         for name in functions {
@@ -61,6 +65,7 @@ impl LlamaMetalModel {
         }
     }
 
+    /// Returns a scratch buffer of the specified size, creating it if necessary.
     pub fn get_scratch(&mut self, name: &str, size: usize) -> Retained<ProtocolObject<dyn MTLBuffer>> {
         if let Some(buf) = self.scratch_buffers.get(name) {
             if buf.length() >= size as _ {
@@ -76,6 +81,7 @@ impl LlamaMetalModel {
         buf
     }
 
+    /// Uploads model weights from a WeightStore to GPU buffers.
     pub fn upload_weights(&mut self, store: &crate::model_loader::WeightStore) -> Result<()> {
         for (name, _info) in &store.index {
             let data = store.get(name).ok_or_else(|| {
@@ -160,21 +166,8 @@ impl LlamaMetalModel {
             for (proj, buf) in [("wq", &q_buf), ("wk", &k_buf), ("wv", &v_buf)] {
                 let weight_name = format!("layers.{}.attention.{}.weight", l, proj);
                 if let Some(w) = self.weights.get(&weight_name) {
-                    let encoder = command_buffer.computeCommandEncoder().unwrap();
-                    let pipeline = self.pipelines.get("matvec_f32").unwrap();
-                    unsafe {
-                        encoder.setComputePipelineState(pipeline);
-                        encoder.setBuffer_offset_atIndex(Some(buf), 0, 0);
-                        encoder.setBuffer_offset_atIndex(Some(w), 0, 1);
-                        encoder.setBuffer_offset_atIndex(Some(&hidden_state), 0, 2);
-                        let rows = if proj == "wq" { n_embd } else { n_head_kv * head_dim };
-                        let rows_u32 = rows as u32;
-                        let n_embd_u32 = n_embd as u32;
-                        encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&rows_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 3);
-                        encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_embd_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
-                        encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: rows as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
-                        encoder.endEncoding();
-                    }
+                    let rows = if proj == "wq" { n_embd } else { n_head_kv * head_dim };
+                    self.dispatch_matvec(&command_buffer, buf, w, &hidden_state, rows, n_embd)?;
                 }
             }
 
@@ -293,23 +286,11 @@ impl LlamaMetalModel {
                     encoder.endEncoding();
                 }
             }
-            
+           
             let attn_out_proj = self.get_scratch("attn_out_proj", n_embd * std::mem::size_of::<f32>());
             let wo_name = format!("layers.{}.attention.wo.weight", l);
             if let Some(w) = self.weights.get(&wo_name) {
-                let encoder = command_buffer.computeCommandEncoder().unwrap();
-                let pipeline = self.pipelines.get("matvec_f32").unwrap();
-                unsafe {
-                    encoder.setComputePipelineState(pipeline);
-                    encoder.setBuffer_offset_atIndex(Some(&attn_out_proj), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(w), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&attn_out), 0, 2);
-                    let n_embd_u32 = n_embd as u32;
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_embd_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 3);
-                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_embd_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
-                    encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n_embd as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
-                    encoder.endEncoding();
-                }
+                self.dispatch_matvec(&command_buffer, &attn_out_proj, w, &attn_out, n_embd, n_embd)?;
 
                 let encoder = command_buffer.computeCommandEncoder().unwrap();
                 unsafe {
@@ -346,20 +327,7 @@ impl LlamaMetalModel {
                 for (proj, buf) in [("w1", &gate_buf), ("w3", &up_buf)] {
                     let weight_name = format!("layers.{}.feed_forward.{}.weight", l, proj);
                     if let Some(w) = self.weights.get(&weight_name) {
-                        let encoder = command_buffer.computeCommandEncoder().unwrap();
-                        let pipeline = self.pipelines.get("matvec_f32").unwrap();
-                        unsafe {
-                            encoder.setComputePipelineState(pipeline);
-                            encoder.setBuffer_offset_atIndex(Some(buf), 0, 0);
-                            encoder.setBuffer_offset_atIndex(Some(w), 0, 1);
-                            encoder.setBuffer_offset_atIndex(Some(&mlp_in), 0, 2);
-                            let n_ff_u32 = n_ff as u32;
-                            let n_embd_u32 = n_embd as u32;
-                            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_ff_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 3);
-                            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_embd_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
-                            encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n_ff as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
-                            encoder.endEncoding();
-                        }
+                        self.dispatch_matvec(&command_buffer, buf, w, &mlp_in, n_ff, n_embd)?;
                     }
                 }
 
@@ -368,7 +336,7 @@ impl LlamaMetalModel {
                     encoder.setComputePipelineState(self.pipelines.get("silu").unwrap());
                     encoder.setBuffer_offset_atIndex(Some(&gate_buf), 0, 0);
                     encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n_ff as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
-                    
+                   
                     encoder.setComputePipelineState(self.pipelines.get("vec_mul").unwrap());
                     encoder.setBuffer_offset_atIndex(Some(&gate_buf), 0, 0);
                     encoder.setBuffer_offset_atIndex(Some(&up_buf), 0, 1);
@@ -379,20 +347,7 @@ impl LlamaMetalModel {
                 let mlp_out = self.get_scratch("mlp_out", n_embd * std::mem::size_of::<f32>());
                 let w2_name = format!("layers.{}.feed_forward.w2.weight", l);
                 if let Some(w) = self.weights.get(&w2_name) {
-                    let encoder = command_buffer.computeCommandEncoder().unwrap();
-                    let pipeline = self.pipelines.get("matvec_f32").unwrap();
-                    unsafe {
-                        encoder.setComputePipelineState(pipeline);
-                        encoder.setBuffer_offset_atIndex(Some(&mlp_out), 0, 0);
-                        encoder.setBuffer_offset_atIndex(Some(w), 0, 1);
-                        encoder.setBuffer_offset_atIndex(Some(&gate_buf), 0, 2);
-                        let n_embd_u32 = n_embd as u32;
-                        let n_ff_u32 = n_ff as u32;
-                        encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_embd_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 3);
-                        encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_ff_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
-                        encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n_embd as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
-                        encoder.endEncoding();
-                    }
+                    self.dispatch_matvec(&command_buffer, &mlp_out, w, &gate_buf, n_embd, n_ff)?;
 
                     let encoder = command_buffer.computeCommandEncoder().unwrap();
                     unsafe {
@@ -426,20 +381,7 @@ impl LlamaMetalModel {
         let n_vocab = self.meta.n_vocab;
         let logits_buf = self.get_scratch("logits", n_vocab * std::mem::size_of::<f32>());
         if let Some(w) = self.weights.get("output.weight") {
-            let encoder = command_buffer.computeCommandEncoder().unwrap();
-            let pipeline = self.pipelines.get("matvec_f32").unwrap();
-            unsafe {
-                encoder.setComputePipelineState(pipeline);
-                encoder.setBuffer_offset_atIndex(Some(&logits_buf), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(w), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(&hidden_state), 0, 2);
-                let n_vocab_u32 = n_vocab as u32;
-                let n_embd_u32 = n_embd as u32;
-                encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_vocab_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 3);
-                encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_embd_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
-                encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n_vocab as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
-                encoder.endEncoding();
-            }
+            self.dispatch_matvec(&command_buffer, &logits_buf, w, &hidden_state, n_vocab, n_embd)?;
         }
 
         command_buffer.commit();
@@ -454,5 +396,39 @@ impl LlamaMetalModel {
             );
         }
         Ok(logits)
+    }
+
+    fn dispatch_matvec(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        out: &ProtocolObject<dyn MTLBuffer>,
+        weight: &ProtocolObject<dyn MTLBuffer>,
+        x: &ProtocolObject<dyn MTLBuffer>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<()> {
+        let is_q4_0 = self.meta.quantization == crate::metal::Quantization::Q4_0;
+        let pipeline_name = if is_q4_0 { "matvec_q4_0" } else { "matvec_f32" };
+        let pipeline = self.pipelines.get(pipeline_name).ok_or_else(|| {
+            SpeculativeError::Model(format!("Pipeline {} not found", pipeline_name))
+        })?;
+
+        let encoder = command_buffer.computeCommandEncoder().ok_or_else(|| {
+            SpeculativeError::Model("Failed to create command encoder".to_string())
+        })?;
+
+        unsafe {
+            encoder.setComputePipelineState(pipeline);
+            encoder.setBuffer_offset_atIndex(Some(out), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(weight), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(x), 0, 2);
+            let rows_u32 = rows as u32;
+            let cols_u32 = cols as u32;
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&rows_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 3);
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&cols_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
+            encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: rows as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
+            encoder.endEncoding();
+        }
+        Ok(())
     }
 }

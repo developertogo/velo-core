@@ -528,7 +528,7 @@ mod tests {
         let n_layer = 1;
         let weights = WeightStore::dummy_llama(n_vocab, n_embd, n_layer);
         let mut model = LlamaCpuModel::new(weights);
-        
+       
         let logits = model.forward_one(1, 0).unwrap();
         assert_eq!(logits.len(), n_vocab);
         // With all zero weights (except maybe SwiGLU if we were careful),
@@ -569,11 +569,11 @@ mod tests {
         let mut weights = WeightStore::dummy_llama(n_vocab, n_embd, 1);
         // Tie weights by removing output.weight
         weights.index.remove("output.weight");
-        
+       
         let mut model = LlamaCpuModel::new(weights);
         model.bind_prefix_cache(&CacheLookup { matched_tokens: 1, handle: None }).unwrap();
         assert!(model.bound_prefix.is_some());
-        
+       
         // forward_one should now use token_embd.weight for logits
         let logits = model.forward_one(1, 0).unwrap();
         assert_eq!(logits.len(), n_vocab);

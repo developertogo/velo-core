@@ -1,9 +1,9 @@
 use crate::gguf::GgmlType;
 
-/// Quantization formats supported by the Metal backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Quantization {
     /// 4-bit quantization (block-based).
+    #[default]
     Q4_0,
     /// 4-bit K-quantization (Super-block).
     Q4K,
@@ -47,7 +47,7 @@ impl Quantization {
             Self::Q8K => "Q8_K",
         }
     }
-    
+   
     pub fn from_ggml(dtype: GgmlType) -> Option<Self> {
         match dtype {
             GgmlType::F32 => Some(Self::F32),
@@ -94,5 +94,42 @@ pub struct MetalDeviceInfo {
     /// Human-readable name of the GPU (e.g., "Apple M3 Max").
     pub name: String,
     /// Whether the device supports unified memory architecture.
+    /// Whether the device supports unified memory architecture.
     pub unified_memory: bool,
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_quantization_from_str() {
+        assert_eq!(Quantization::from_str("q4_0").unwrap(), Quantization::Q4_0);
+        assert_eq!(Quantization::from_str("Q4_K").unwrap(), Quantization::Q4K);
+        assert_eq!(Quantization::from_str("f32").unwrap(), Quantization::F32);
+        assert!(Quantization::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn test_quantization_properties() {
+        assert_eq!(Quantization::Q4_0.block_size(), 32);
+        assert_eq!(Quantization::F32.block_size(), 1);
+        assert_eq!(Quantization::Q4_0.type_name(), "Q4_0");
+    }
+
+    #[test]
+    fn test_quantization_from_ggml() {
+        assert_eq!(Quantization::from_ggml(GgmlType::F32).unwrap(), Quantization::F32);
+        assert_eq!(Quantization::from_ggml(GgmlType::Q4_0).unwrap(), Quantization::Q4_0);
+        assert!(Quantization::from_ggml(GgmlType::Q5_0).is_none());
+    }
+
+    #[test]
+    fn test_metal_error_display() {
+        let err = MetalError::LibraryError("failed".into());
+        assert_eq!(format!("{}", err), "Metal library error: failed");
+    }
 }

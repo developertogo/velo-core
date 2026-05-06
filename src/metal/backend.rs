@@ -27,7 +27,11 @@ pub struct MetalBackend {
     pub slot_mapping: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
+unsafe impl Send for MetalBackend {}
+unsafe impl Sync for MetalBackend {}
+
 impl MetalBackend {
+    /// Creates a new MetalBackend with the provided configuration.
     pub fn new(config: MetalBackendConfig) -> Result<Self> {
         if config.max_context_tokens == 0 {
             return Err(SpeculativeError::Model(
@@ -78,6 +82,7 @@ impl MetalBackend {
         )
     }
 
+    /// Wires the backend to a weight store and a memory runtime, initializing GPU resources.
     pub fn wire(&mut self, store: crate::model_loader::WeightStore, runtime: &MetalMemoryRuntime) -> Result<()> {
         let handles = runtime.context().handles.clone();
         let device = handles.device.clone().ok_or_else(|| SpeculativeError::Model("Runtime missing device".into()))?;
@@ -86,13 +91,13 @@ impl MetalBackend {
 
         let mut model = LlamaMetalModel::new(store.meta.clone(), device, queue, library);
         model.upload_weights(&store)?;
-        
+       
         self.model = Some(Arc::new(Mutex::new(model)));
         self.device = runtime.context().device.clone();
         self.allocator = Some(runtime.allocator.clone());
         self.store = Some(runtime.store.clone());
         self.slot_mapping = Some(runtime.slot_mapping.clone());
-        
+       
         Ok(())
     }
 }
@@ -140,7 +145,7 @@ impl CausalLmBackend for MetalBackend {
             block_indices.push((block.offset / page_bytes) as u32);
         }
 
-        let pos = context.len() - 1; 
+        let pos = context.len() - 1;
         let logits = model.forward_one(
             last,
             pos,
@@ -188,7 +193,7 @@ impl CausalLmBackend for MetalBackend {
 
         let mut result = Vec::with_capacity(drafted.len());
         let mut current_pos = context.len();
-        
+       
         let slot_id = self.slot_id.ok_or_else(|| SpeculativeError::Model("Slot not bound".into()))?;
         let slot_mapping = self.slot_mapping.as_ref().ok_or_else(|| SpeculativeError::Model("Slot mapping not wired".into()))?;
         let max_pages = allocator.config().total_pages;
@@ -222,7 +227,7 @@ mod tests {
         let mut cfg = MetalBackendConfig::default();
         cfg.max_context_tokens = 0;
         assert!(MetalBackend::new(cfg).is_err());
-        
+       
         let mut cfg = MetalBackendConfig::default();
         cfg.kv_bytes_per_token = 0;
         assert!(MetalBackend::new(cfg).is_err());
@@ -232,5 +237,16 @@ mod tests {
     fn test_metal_backend_not_initialized() {
         let backend = MetalBackend::new(MetalBackendConfig::default()).unwrap();
         assert!(format!("{:?}", backend).contains("MetalBackend"));
+        assert_eq!(backend.config().max_context_tokens, MetalBackendConfig::default().max_context_tokens);
+        assert_eq!(backend.device().name, "apple-metal-placeholder");
+    }
+
+    #[test]
+    fn test_metal_backend_errors() {
+        let mut backend = MetalBackend::new(MetalBackendConfig::default()).unwrap();
+        // Should error if calling next_logits before wire()
+        let res = backend.next_logits(&[1]);
+        assert!(res.is_err());
+        assert!(format!("{:?}", res).contains("not wired"));
     }
 }

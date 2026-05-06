@@ -312,11 +312,11 @@ mod tests {
         // Subnormal
         assert_eq!(f16_to_f32(0x0001), 1.0 / (1u32 << 24) as f32);
         assert_eq!(f16_to_f32(0x8001), -(1.0 / (1u32 << 24) as f32));
-        
+       
         // Infinity
         assert!(f16_to_f32(0x7C00).is_infinite());
         assert!(f16_to_f32(0xFC00).is_infinite());
-        
+       
         // NaN
         assert!(f16_to_f32(0x7C01).is_nan());
     }

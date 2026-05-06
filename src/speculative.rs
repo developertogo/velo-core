@@ -479,7 +479,7 @@ mod tests {
     fn batch_default_impls() {
         struct D; impl DraftModel for D { fn draft(&mut self, _: &[TokenId], m: usize) -> Result<Vec<NextTokenPrediction>> { Ok(vec![NextTokenPrediction{token:1, confidence:1.0}; m]) } }
         struct T; impl TargetModel for T { fn verify(&mut self, _: &[TokenId], d: &[TokenId]) -> Result<Vec<VerifyStep>> { Ok(vec![VerifyStep{expected:1}; d.len()]) } }
-        
+       
         let mut d = D;
         let mut t = T;
         assert!(d.draft_batch(&[(&[1], 1)]).is_ok());
@@ -497,7 +497,7 @@ mod tests {
         let accepted = session.commit(&drafted, &verified).unwrap();
         assert_eq!(accepted, vec![2]);
         assert_eq!(session.context(), vec![1, 2]);
-        
+       
         // Error path
         assert!(session.commit(&drafted, &[]).is_err());
     }
@@ -516,7 +516,7 @@ mod tests {
     fn draft_error_paths() {
         let decoder = SpeculativeDecoder::new(4).unwrap();
         let mut session = decoder.begin(&[1]).unwrap();
-        
+       
         struct BadDraft;
         impl DraftModel for BadDraft {
             fn draft(&mut self, _: &[TokenId], _: usize) -> Result<Vec<NextTokenPrediction>> {
@@ -544,7 +544,7 @@ mod tests {
 
         assert!(session.draft(&mut BadDraft, &mut OkTarget, 4).is_err());
         assert!(session.draft(&mut EmptyDraft, &mut OkTarget, 4).unwrap().is_empty());
-        
+       
         let mut session = decoder.begin(&[1]).unwrap();
         let mut good_draft = ScriptedDraft { script: vec![1, 2, 3] };
         assert!(session.draft(&mut good_draft, &mut BadTarget, 4).is_err());

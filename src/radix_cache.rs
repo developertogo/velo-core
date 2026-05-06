@@ -396,7 +396,7 @@ mod tests {
         let mut cache = RadixCache::new();
         cache.insert(&[1, 2, 3], handle(1, 3));
         assert_eq!(cache.resident_tokens(), 3);
-        
+       
         cache.set_capacity_tokens(Some(1));
         assert_eq!(cache.resident_tokens(), 0);
         assert!(cache.is_empty());
@@ -406,13 +406,13 @@ mod tests {
     fn debug_impls() {
         let cache = RadixCache::new();
         assert!(format!("{:?}", cache).contains("RadixCache"));
-        
+       
         let c = CacheLookup { matched_tokens: 0, handle: None };
         assert!(format!("{:?}", c).contains("CacheLookup"));
-        
+       
         let i = CacheInsert { inserted_tokens: 0, replaced: None, handle: handle(1, 1) };
         assert!(format!("{:?}", i).contains("CacheInsert"));
-        
+       
         let e = CacheEviction { evicted: vec![] };
         assert!(format!("{:?}", e).contains("CacheEviction"));
     }

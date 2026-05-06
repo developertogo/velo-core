@@ -11,11 +11,16 @@ kernel void rms_norm(
     constant uint& dim [[buffer(4)]],
     uint tpig [[thread_position_in_grid]]
 ) {
-    // Basic implementation: each thread handles one element
-    // Scaling is done using a pre-calculated RMS value for the row
-    // In this simple version, we assume RMS is passed or calculated per row elsewhere
-    // To make it self-contained in one pass, we use a slower approach or two passes.
-    // For now, let's implement a single-pass version using threadgroup reduction.
+    if (tpig >= 1) return; // Only one thread for now to simplify, handles whole row
+
+    float ss = 0.0f;
+    for (uint i = 0; i < dim; i++) {
+        ss += x_in[i] * x_in[i];
+    }
+    float scale = 1.0f / sqrt(ss / (float)dim + eps);
+    for (uint i = 0; i < dim; i++) {
+        x_out[i] = x_in[i] * scale * w[i];
+    }
 }
 
 // ── Rotary Position Embedding (RoPE) ──────────────────────────────────────────
@@ -32,7 +37,7 @@ kernel void rope(
     // We only process the first half of head_dim per thread to handle pairs
     uint i = tpig * 2;
     uint h_dim_idx = i % head_dim;
-    
+
     float theta = pow(freq_base, -(float)h_dim_idx / (float)head_dim);
     float m_theta = (float)pos * theta;
     float cos_mt = cos(m_theta);
@@ -62,10 +67,42 @@ kernel void matvec_f32(
     uint tpig [[thread_position_in_grid]]
 ) {
     if (tpig >= rows) return;
-    
+
     float sum = 0.0f;
     for (uint c = 0; c < cols; c++) {
         sum += w[tpig * cols + c] * x[c];
+    }
+    out[tpig] = sum;
+}
+
+// ── Matrix-Vector Multiply (Q4_0) ─────────────────────────────────────────────
+// Block: 2 bytes scale (f16) + 16 bytes nibbles (32 elements) = 18 bytes.
+kernel void matvec_q4_0(
+    device float* out [[buffer(0)]],
+    device const uchar* w [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    uint tpig [[thread_position_in_grid]]
+) {
+    if (tpig >= rows) return;
+
+    float sum = 0.0f;
+    uint n_blocks = cols / 32;
+    uint row_offset = tpig * n_blocks * 18;
+
+    for (uint b = 0; b < n_blocks; b++) {
+        uint block_start = row_offset + b * 18;
+        half delta = *(device const half*)(w + block_start);
+        device const uchar* nibbles = w + block_start + 2;
+
+        for (uint i = 0; i < 16; i++) {
+            uchar byte = nibbles[i];
+            float lo = (float)((int)(byte & 0x0F) - 8);
+            float hi = (float)((int)(byte >> 4) - 8);
+            sum += (float)delta * lo * x[b * 32 + i * 2];
+            sum += (float)delta * hi * x[b * 32 + i * 2 + 1];
+        }
     }
     out[tpig] = sum;
 }
@@ -97,21 +134,22 @@ kernel void softmax(
     constant uint& n [[buffer(1)]],
     uint tpig [[thread_position_in_grid]]
 ) {
-    // This expects one thread per row, and it handles the whole row.
-    // Extremely inefficient for large rows, but works for small attention heads.
+    if (tpig >= 1) return; // One thread handles the whole row for now
+
     float max_val = -INFINITY;
     for (uint i = 0; i < n; i++) {
         max_val = max(max_val, x[i]);
     }
-    
+
     float sum = 0.0f;
     for (uint i = 0; i < n; i++) {
         x[i] = exp(x[i] - max_val);
         sum += x[i];
     }
-    
+
+    float inv_sum = 1.0f / sum;
     for (uint i = 0; i < n; i++) {
-        x[i] /= sum;
+        x[i] *= inv_sum;
     }
 }
 
@@ -134,7 +172,9 @@ kernel void attn_q_k(
     uint head_idx = tpig;
     device const float* head_q = q + head_idx * head_dim;
     device float* head_scores = scores + head_idx * n_ctx;
-    
+
+    float inv_sqrt_head_dim = 1.0f / sqrt((float)head_dim);
+
     for (uint t = 0; t <= pos; t++) {
         float sum = 0.0f;
         uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
@@ -143,7 +183,7 @@ kernel void attn_q_k(
         for (uint d = 0; d < head_dim; d++) {
             sum += head_q[d] * head_k[d];
         }
-        head_scores[t] = sum / sqrt((float)head_dim);
+        head_scores[t] = sum * inv_sqrt_head_dim;
     }
 }
 
@@ -164,7 +204,7 @@ kernel void attn_p_v(
     uint head_idx = tpig;
     device const float* head_probs = probs + head_idx * n_ctx;
     device float* head_out = out + head_idx * head_dim;
-    
+
     for (uint d = 0; d < head_dim; d++) {
         float sum = 0.0f;
         for (uint t = 0; t <= pos; t++) {
@@ -197,7 +237,7 @@ kernel void kv_update(
 
     uint block_idx = slot_mapping[slot_id * max_pages + (pos / block_size)];
     uint token_in_block = pos % block_size;
-    
+
     uint cache_offset = (block_idx * block_size * n_head * head_dim) + (token_in_block * n_head * head_dim) + (head_idx * head_dim) + dim_idx;
     uint in_offset = (head_idx * head_dim) + dim_idx;
 
