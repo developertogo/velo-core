@@ -24,11 +24,16 @@ impl Ord for TokenLogit {
     }
 }
 
+/// Trait for token sampling strategies.
 pub trait Sampler {
+    /// Selects a token from the provided logits, optionally respecting a bitmask.
     fn sample(&self, logits: &[f32], mask: Option<&LogitMask>) -> NextTokenPrediction;
+    
+    /// Returns true if this sampler is purely deterministic (always picks the best token).
     fn is_greedy(&self) -> bool { false }
 }
 
+/// A sampler that always selects the token with the highest logit value.
 pub struct GreedySampler;
 
 impl Sampler for GreedySampler {
@@ -42,13 +47,9 @@ impl Sampler for GreedySampler {
                 }
             }
             if logit >= max_logit {
-                // if mask.is_some() { println!("  New max: token {} logit {}", i, logit); }
                 max_logit = logit;
                 max_token = i as TokenId;
             }
-        }
-        if mask.is_some() {
-            println!("GreedySampler picked token {} with logit {}", max_token, max_logit);
         }
         NextTokenPrediction {
             token: max_token,
@@ -58,12 +59,17 @@ impl Sampler for GreedySampler {
     fn is_greedy(&self) -> bool { true }
 }
 
+/// Nucleus sampling (Top-P): selects tokens from the smallest set whose cumulative probability exceeds P.
 pub struct TopPSampler {
+    /// The probability threshold (e.g. 0.9).
     pub p: f32,
+    /// Softmax temperature. Higher values increase diversity.
     pub temperature: f32,
 }
 
+/// Top-K sampling: selects from the top K most likely tokens.
 pub struct TopKSampler {
+    /// Number of top tokens to consider.
     pub k: usize,
 }
 

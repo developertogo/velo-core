@@ -3,6 +3,19 @@ using namespace metal;
 
 // ── RMS Norm ──────────────────────────────────────────────────────────────────
 
+/**
+ * Root Mean Square Layer Normalization (RMSNorm).
+ * 
+ * Normalizes the input vector by its root mean square, then scales by weights.
+ * Used to stabilize training and inference by maintaining activation variance.
+ * 
+ * @param x_out  Output buffer [dim]
+ * @param x_in   Input buffer [dim]
+ * @param w      Weight buffer for scaling [dim]
+ * @param eps    Small epsilon value to prevent division by zero
+ * @param dim    Dimensionality of the input/output vectors
+ * @param tpig   Thread position in grid (only thread 0 executes)
+ */
 kernel void rms_norm(
     device float* x_out [[buffer(0)]],
     device const float* x_in [[buffer(1)]],
@@ -25,6 +38,19 @@ kernel void rms_norm(
 
 // ── Rotary Position Embedding (RoPE) ──────────────────────────────────────────
 
+/**
+ * Rotary Position Embedding (RoPE).
+ * 
+ * Injects positional information into query and key vectors by rotating pairs 
+ * of coordinates based on their position in the sequence.
+ * 
+ * @param q          Query buffer to rotate in-place
+ * @param k          Key buffer to rotate in-place
+ * @param pos        Current sequence position
+ * @param head_dim   Dimensionality of each attention head
+ * @param freq_base  Base frequency for the rotation angles (e.g., 10000.0)
+ * @param tpig       Thread position in grid (handles pairs of dimensions)
+ */
 kernel void rope(
     device float* q [[buffer(0)]],
     device float* k [[buffer(1)]],
@@ -58,6 +84,18 @@ kernel void rope(
 
 // ── Matrix-Vector Multiply ────────────────────────────────────────────────────
 
+/**
+ * Standard Matrix-Vector Multiplication (FP32).
+ * 
+ * Computes `out = W * x` where W is a matrix and x is a vector.
+ * 
+ * @param out   Output vector buffer [rows]
+ * @param w     Weight matrix buffer [rows, cols] (row-major)
+ * @param x     Input vector buffer [cols]
+ * @param rows  Number of rows in W (output size)
+ * @param cols  Number of columns in W (input size)
+ * @param tpig  Thread position in grid (maps to the row index)
+ */
 kernel void matvec_f32(
     device float* out [[buffer(0)]],
     device const float* w [[buffer(1)]],
@@ -75,6 +113,18 @@ kernel void matvec_f32(
     out[tpig] = sum;
 }
 
+/**
+ * Batched Matrix-Vector Multiplication (FP32).
+ * 
+ * Computes `out[b] = W * x[b]` for multiple vectors in a batch.
+ * 
+ * @param out   Output matrix buffer [batch, rows]
+ * @param w     Weight matrix buffer [rows, cols] (row-major)
+ * @param x     Input matrix buffer [batch, cols]
+ * @param rows  Number of rows in W (output size)
+ * @param cols  Number of columns in W (input size)
+ * @param tpig  Thread position in grid: x=row, y=batch_idx
+ */
 kernel void matvec_batched_f32(
     device float* out [[buffer(0)]], // [batch, rows]
     device const float* w [[buffer(1)]], // [rows, cols]
@@ -96,6 +146,20 @@ kernel void matvec_batched_f32(
 
 // ── Matrix-Vector Multiply (Q4_0) ─────────────────────────────────────────────
 // Block: 2 bytes scale (f16) + 16 bytes nibbles (32 elements) = 18 bytes.
+
+/**
+ * 4-bit Quantized Matrix-Vector Multiplication (Q4_0).
+ * 
+ * Computes `out = W * x` where W is quantized to 4-bit integers with a shared
+ * FP16 scale factor per block of 32 elements.
+ * 
+ * @param out   Output vector buffer [rows]
+ * @param w     Quantized weight matrix buffer
+ * @param x     Input vector buffer [cols]
+ * @param rows  Number of rows in W
+ * @param cols  Number of columns in W
+ * @param tpig  Thread position in grid (maps to row index)
+ */
 kernel void matvec_q4_0(
     device float* out [[buffer(0)]],
     device const uchar* w [[buffer(1)]],
@@ -126,6 +190,18 @@ kernel void matvec_q4_0(
     out[tpig] = sum;
 }
 
+/**
+ * Batched 4-bit Quantized Matrix-Vector Multiplication (Q4_0).
+ * 
+ * Computes `out[b] = W * x[b]` for a batch of vectors.
+ * 
+ * @param out   Output matrix buffer [batch, rows]
+ * @param w     Quantized weight matrix buffer
+ * @param x     Input matrix buffer [batch, cols]
+ * @param rows  Number of rows in W
+ * @param cols  Number of columns in W
+ * @param tpig  Thread position in grid: x=row, y=batch_idx
+ */
 kernel void matvec_batched_q4_0(
     device float* out [[buffer(0)]],
     device const uchar* w [[buffer(1)]],
@@ -160,6 +236,14 @@ kernel void matvec_batched_q4_0(
 
 // ── Activation (SiLU) ─────────────────────────────────────────────────────────
 
+/**
+ * Sigmoid Linear Unit (SiLU) Activation.
+ * 
+ * Applies the SiLU activation function element-wise: `f(x) = x / (1 + exp(-x))`.
+ * 
+ * @param x     Input/Output buffer (modified in-place)
+ * @param tpig  Thread position in grid (maps to vector element index)
+ */
 kernel void silu(
     device float* x [[buffer(0)]],
     uint tpig [[thread_position_in_grid]]
@@ -170,6 +254,15 @@ kernel void silu(
 
 // ── Element-wise Multiplication ──────────────────────────────────────────────
 
+/**
+ * Element-wise Vector Multiplication.
+ * 
+ * Computes `x[i] = x[i] * y[i]` for two vectors.
+ * 
+ * @param x     First vector buffer (modified in-place)
+ * @param y     Second vector buffer (read-only)
+ * @param tpig  Thread position in grid (maps to vector element index)
+ */
 kernel void vec_mul(
     device float* x [[buffer(0)]],
     device const float* y [[buffer(1)]],
@@ -178,8 +271,75 @@ kernel void vec_mul(
     x[tpig] *= y[tpig];
 }
 
+// ── LoRA Kernels ─────────────────────────────────────────────────────────────
+
+/**
+ * Batched LoRA Matrix-Vector Multiplication.
+ * 
+ * Computes the LoRA correction delta for a batch of sequences where each 
+ * sequence can have a different adapter. 
+ * Math: out = out + (scale * (x * A) * B)
+ * 
+ * @param out           Output buffer to accumulate the LoRA delta [batch_size, d_out]
+ * @param x             Input activation buffer [batch_size, d_in]
+ * @param all_lora_a    Global pool of LoRA-A weights
+ * @param all_lora_b    Global pool of LoRA-B weights
+ * @param lora_offsets  Array of (offset_a, offset_b) pairs per batch row
+ * @param lora_scales   Array of scaling factors per batch row
+ * @param d_in          Input dimension size
+ * @param d_out         Output dimension size
+ * @param r             LoRA rank
+ * @param batch_size    Number of sequences in the batch
+ */
+kernel void matvec_lora_batched(
+    device float* out [[buffer(0)]],            // [batch_size, d_out] (Accumulates!)
+    device const float* x [[buffer(1)]],        // [batch_size, d_in]
+    device const float* all_lora_a [[buffer(2)]],
+    device const float* all_lora_b [[buffer(3)]],
+    device const uint2* lora_offsets [[buffer(4)]], // (offset_a, offset_b) per batch row
+    device const float* lora_scales [[buffer(5)]],
+    constant uint& d_in [[buffer(6)]],
+    constant uint& d_out [[buffer(7)]],
+    constant uint& r [[buffer(8)]],
+    constant uint& batch_size [[buffer(9)]],
+    uint2 tpig [[thread_position_in_grid]] // [col, batch_idx]
+) {
+    uint col = tpig.x;
+    uint batch_idx = tpig.y;
+    if (col >= d_out || batch_idx >= batch_size) return;
+
+    uint2 offsets = lora_offsets[batch_idx];
+    if (offsets.x == 0xFFFFFFFF) return; // No adapter for this row
+
+    device const float* lora_a = all_lora_a + offsets.x;
+    device const float* lora_b = all_lora_b + offsets.y;
+    float scale = lora_scales[batch_idx];
+    device const float* x_row = x + batch_idx * d_in;
+
+    float lora_sum = 0.0f;
+    for (uint j = 0; j < r; j++) {
+        float xa = 0.0f;
+        for (uint i = 0; i < d_in; i++) {
+            xa += x_row[i] * lora_a[j * d_in + i];
+        }
+        lora_sum += xa * lora_b[col * r + j];
+    }
+
+    out[batch_idx * d_out + col] += lora_sum * scale;
+}
+
 // ── Softmax ───────────────────────────────────────────────────────────────────
 
+/**
+ * Softmax Activation.
+ * 
+ * Applies the Softmax function over a vector to convert logits into probabilities.
+ * Stable implementation subtracts the maximum value before exponentiation.
+ * 
+ * @param x     Input/Output buffer (modified in-place)
+ * @param n     Length of the vector
+ * @param tpig  Thread position in grid (only thread 0 executes, processes full vector)
+ */
 kernel void softmax(
     device float* x [[buffer(0)]],
     constant uint& n [[buffer(1)]],
@@ -390,6 +550,24 @@ kernel void paged_attention_tree(
     for (uint d = 0; d < head_dim; d++) node_out[d] = acc[d] / l;
 }
 
+/**
+ * KV Cache Update (FP32).
+ * 
+ * Copies the Key and Value vectors for the current token into the global paged KV cache.
+ * 
+ * @param k_cache       Global Key cache buffer
+ * @param v_cache       Global Value cache buffer
+ * @param k_in          Input Key vector for current token
+ * @param v_in          Input Value vector for current token
+ * @param slot_id       ID of the active inference slot
+ * @param slot_mapping  Buffer mapping slots to physical KV pages
+ * @param max_pages     Total number of pages in the pool
+ * @param block_size    Number of tokens per KV page
+ * @param n_head        Number of KV heads
+ * @param head_dim      Dimensionality of each KV head
+ * @param pos           Current sequence position
+ * @param tpig          Thread position in grid (maps to `head_idx * head_dim + dim_idx`)
+ */
 kernel void kv_update(
     device float* k_cache [[buffer(0)]],
     device float* v_cache [[buffer(1)]],
@@ -421,6 +599,28 @@ kernel void kv_update(
 // ── Quantized Attention (INT8) ────────────────────────────────────────────────
 // Cache layout: [Block][Token][Head][Dim] where Dim is char[head_dim] + float scale
 
+/**
+ * Flash Attention 2 for INT8 Paged KV Cache.
+ * 
+ * Computes attention scores where the KV cache is stored in 8-bit integers 
+ * with a per-token/per-head FP32 scale factor. Unquantizes the keys and values 
+ * on the fly during computation.
+ * 
+ * @param out           Output buffer for attention results [n_head, head_dim]
+ * @param q             Query buffer for the current token [n_head, head_dim]
+ * @param k_cache       Global INT8 Key cache buffer
+ * @param v_cache       Global INT8 Value cache buffer
+ * @param head_dim      Dimensionality of each attention head
+ * @param n_ctx         Total context length (not used in tiling loop)
+ * @param pos           Current sequence position
+ * @param slot_id       ID of the active inference slot
+ * @param slot_mapping  Buffer mapping slots to physical KV pages
+ * @param max_pages     Total number of pages in the pool
+ * @param block_size    Number of tokens per KV page
+ * @param n_head_kv     Number of KV heads (for GQA)
+ * @param n_head        Number of query heads
+ * @param head_idx      Thread position mapping to the query head index
+ */
 kernel void paged_attention_flash_int8(
     device float* out [[buffer(0)]],
     device const float* q [[buffer(1)]],
@@ -483,6 +683,25 @@ kernel void paged_attention_flash_int8(
     }
 }
 
+/**
+ * KV Cache Update (INT8 Quantization).
+ * 
+ * Quantizes and copies the FP32 Key and Value vectors for the current token 
+ * into the global INT8 paged KV cache. Calculates and stores a per-head scale factor.
+ * 
+ * @param k_cache       Global INT8 Key cache buffer
+ * @param v_cache       Global INT8 Value cache buffer
+ * @param k_in          Input FP32 Key vector for current token
+ * @param v_in          Input FP32 Value vector for current token
+ * @param slot_id       ID of the active inference slot
+ * @param slot_mapping  Buffer mapping slots to physical KV pages
+ * @param max_pages     Total number of pages in the pool
+ * @param block_size    Number of tokens per KV page
+ * @param n_head        Number of KV heads
+ * @param head_dim      Dimensionality of each KV head
+ * @param pos           Current sequence position
+ * @param tpig          Thread position in grid (maps to `head_idx`)
+ */
 kernel void kv_update_int8(
     device char* k_cache [[buffer(0)]],
     device char* v_cache [[buffer(1)]],
@@ -536,6 +755,15 @@ kernel void kv_update_int8(
 
 // ── Element-wise Addition ─────────────────────────────────────────────────────
 
+/**
+ * Element-wise Vector Addition.
+ * 
+ * Computes `x[i] = x[i] + y[i]` for two vectors.
+ * 
+ * @param x     First vector buffer (modified in-place)
+ * @param y     Second vector buffer (read-only)
+ * @param tpig  Thread position in grid (maps to vector element index)
+ */
 kernel void vec_add(
     device float* x [[buffer(0)]],
     device const float* y [[buffer(1)]],

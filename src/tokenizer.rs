@@ -32,10 +32,12 @@ impl Tokenizer {
         Self { tokens, token_to_id, chat_template }
     }
 
+    /// Returns the number of tokens in the vocabulary.
     pub fn vocab_size(&self) -> usize {
         self.tokens.len()
     }
 
+    /// Converts a token ID to its string representation.
     pub fn id_to_token(&self, id: u32) -> &str {
         self.tokens.get(id as usize).map(|s| s.as_str()).unwrap_or("<unk>")
     }
@@ -81,6 +83,8 @@ impl Tokenizer {
         result.replace(" ", " ")
     }
 
+    /// Applies the model's chat template to a list of messages.
+    /// This converts a structured conversation into a raw string prompt for the model.
     #[cfg(feature = "serve")]
     pub fn apply_chat_template(&self, messages: &[serde_json::Value], add_generation_prompt: bool) -> Result<String, String> {
         let template_str = self.chat_template.as_deref().unwrap_or(

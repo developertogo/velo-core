@@ -1,3 +1,10 @@
+//! Velo-Core: A high-performance inference engine for Apple Silicon.
+//! 
+//! This crate provides a fully optimized, AOT-compiled Metal backend for executing
+//! large language models on macOS/iOS devices. It supports advanced features like
+//! Paged Attention, Speculative Decoding (Tree Verification), and Multi-LoRA
+//! dispatching, maximizing memory bandwidth utilization.
+
 pub mod benchmark;
 pub mod backend;
 pub mod engine;
@@ -19,8 +26,10 @@ pub mod sampling;
 pub mod model_pool;
 pub mod constraints;
 pub mod ffi;
+pub mod lora;
 
 pub use constraints::{CfgMatcher, Constraint};
+pub use lora::{AdapterId, LoraRegistry, LoraConfig, LoraWeights};
 
 pub use benchmark::{
     compare_with_llama_csv, load_llama_csv, parse_llama_csv, BenchmarkConfig, BenchmarkFormat,
