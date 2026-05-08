@@ -30,6 +30,7 @@ pub mod lora;
 pub mod amx;
 pub mod power;
 pub mod nixl;
+pub mod disagg;
 
 pub use constraints::{CfgMatcher, Constraint};
 pub use lora::{AdapterId, LoraRegistry, LoraConfig, LoraWeights};
@@ -39,6 +40,9 @@ pub use nixl::{
     build_fabric, deserialize_block, serialize_block,
     CacheTransferAgent, DmaBlockManager, DmaStats, NixlNodeId, NodeRegistry,
     RemoteBlock, TransferOutcome, TransferStats, WIRE_HEADER_LEN,
+};
+pub use disagg::{
+    build_disagg_pool, DecodeTask, DisaggPool, DisaggStats, NodeRole, PrefillTask,
 };
 
 pub use benchmark::{
