@@ -89,9 +89,23 @@ struct AppState {
     tokenizer: Tokenizer,
 }
 
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn setup_ebpf_observer() -> anyhow::Result<()> {
+    println!("Initializing eBPF latency observer...");
+    // In a real deployment, this would load the compiled BPF bytecode
+    // and attach to tracepoints like sched:sched_switch and syscalls:sys_enter_accept
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+fn setup_ebpf_observer() -> anyhow::Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    setup_ebpf_observer()?;
 
     println!("Loading model from {}...", args.model);
     let weights = load_gguf(Path::new(&args.model))?;

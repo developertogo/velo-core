@@ -63,6 +63,68 @@ pub struct TopPSampler {
     pub temperature: f32,
 }
 
+pub struct TopKSampler {
+    pub k: usize,
+}
+
+impl Sampler for TopKSampler {
+    fn sample(&self, logits: &[f32], mask: Option<&LogitMask>) -> NextTokenPrediction {
+        let mut tokens: Vec<TokenLogit> = logits
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                if let Some(mask) = mask {
+                    mask.get(*i).unwrap_or(false)
+                } else {
+                    true
+                }
+            })
+            .map(|(i, &logit)| TokenLogit {
+                token: i as TokenId,
+                logit,
+            })
+            .collect();
+
+        tokens.sort_by(|a, b| b.cmp(a));
+        
+        let best = tokens.first().cloned().unwrap_or(TokenLogit { token: 0, logit: -f32::INFINITY });
+        NextTokenPrediction {
+            token: best.token,
+            confidence: best.logit,
+        }
+    }
+}
+
+impl TopKSampler {
+    pub fn sample_top_k(&self, logits: &[f32], mask: Option<&LogitMask>) -> Vec<NextTokenPrediction> {
+        let mut tokens: Vec<TokenLogit> = logits
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                if let Some(mask) = mask {
+                    mask.get(*i).unwrap_or(false)
+                } else {
+                    true
+                }
+            })
+            .map(|(i, &logit)| TokenLogit {
+                token: i as TokenId,
+                logit,
+            })
+            .collect();
+
+        tokens.sort_by(|a, b| b.cmp(a));
+        
+        tokens.into_iter()
+            .take(self.k)
+            .map(|tl| NextTokenPrediction {
+                token: tl.token,
+                confidence: tl.logit,
+            })
+            .collect()
+    }
+}
+
 impl Sampler for TopPSampler {
     fn sample(&self, logits: &[f32], mask: Option<&LogitMask>) -> NextTokenPrediction {
         let temp = self.temperature.max(1e-6);

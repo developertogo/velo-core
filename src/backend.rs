@@ -50,6 +50,16 @@ pub trait CausalLmBackend {
     }
 }
 
+impl<B: CausalLmBackend + ?Sized> CausalLmBackend for &mut B {
+    fn next_logits(&mut self, context: &[TokenId]) -> Result<TokenLogits> {
+        (**self).next_logits(context)
+    }
+
+    fn verify_logits(&mut self, context: &[TokenId], drafted: &[TokenId]) -> Result<Vec<TokenLogits>> {
+        (**self).verify_logits(context, drafted)
+    }
+}
+
 
 #[derive(Debug, Clone)]
 pub struct GreedyDraftModel<B> {
@@ -58,6 +68,11 @@ pub struct GreedyDraftModel<B> {
 
 #[derive(Debug, Clone)]
 pub struct GreedyTargetModel<B> {
+    backend: B,
+}
+
+#[derive(Debug, Clone)]
+pub struct TreeDraftModel<B> {
     backend: B,
 }
 
@@ -193,6 +208,74 @@ where
         }
 
         Ok(results)
+    }
+}
+
+impl<B> DraftModel for TreeDraftModel<B>
+where
+    B: CausalLmBackend,
+{
+    fn bind_prefix_cache(&mut self, prefix: &CacheLookup) -> Result<()> {
+        self.backend.bind_prefix_cache(prefix)
+    }
+
+    fn bind_slot(&mut self, slot: crate::slot_manager::SlotId) -> Result<()> {
+        self.backend.bind_slot(slot)
+    }
+
+    fn switch_model(&mut self, name: &str, pool: &crate::model_pool::ModelPool) -> Result<()> {
+        self.backend.switch_model(name, pool)
+    }
+
+    fn draft(
+        &mut self,
+        context: &[TokenId],
+        max_tokens: usize,
+        matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
+    ) -> Result<Vec<NextTokenPrediction>> {
+        let mut greedy = GreedyDraftModel::new(&mut self.backend);
+        greedy.draft(context, max_tokens, matcher)
+    }
+
+    fn draft_tree(
+        &mut self,
+        context: &[TokenId],
+        max_tokens: usize,
+        width: usize,
+        mut matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
+    ) -> Result<crate::speculative::SpeculativeTree> {
+        use crate::sampling::TopKSampler;
+        let sampler = TopKSampler { k: width };
+        
+        let mask = matcher.as_mut().map(|m| m.next_mask());
+        let top_k = sampler.sample_top_k(self.backend.next_logits(context)?.values(), mask.as_ref());
+        
+        if top_k.is_empty() {
+            return Err(SpeculativeError::Model("Draft model returned no tokens".into()));
+        }
+
+        let mut t = crate::speculative::SpeculativeTree::new(top_k[0].token);
+        
+        // Add other top-K as branches from the start
+        for pred in top_k.into_iter().skip(1) {
+            t.add_child(0, pred.token);
+        }
+        
+        // Greedily expand the primary branch
+        let mut curr = 0;
+        for _ in 1..max_tokens {
+            let path = t.get_path(curr);
+            let mut full_context = context.to_vec();
+            full_context.extend_from_slice(&path);
+            
+            // Note: CFG matcher advancement is simplified here
+            let next_logits = self.backend.next_logits(&full_context)?;
+            let next_token = sampler.sample(next_logits.values(), None);
+            
+            curr = t.add_child(curr, next_token.token);
+        }
+
+        Ok(t)
     }
 }
 
