@@ -21,11 +21,19 @@ pub struct CacheInsert {
     pub handle: KvCacheHandle,
 }
 
+/// A high-performance Radix Tree for KV-cache prefix matching.
+/// 
+/// This cache enables "Sticky Cache" routing by allowing the engine to
+/// identify and reuse KV-cache pages for shared prompt prefixes across requests.
+/// It implements a CLOCK-based eviction policy to manage GPU memory limits.
 #[derive(Debug, Default)]
 pub struct RadixCache {
     nodes: Vec<Node>,
+    /// Optional limit on the number of tokens the cache can hold.
     capacity_tokens: Option<usize>,
+    /// Total number of tokens currently resident in the cache.
     resident_tokens: usize,
+    /// Logical clock used for LRU/CLOCK eviction.
     clock: u64,
 }
 

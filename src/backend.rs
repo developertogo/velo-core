@@ -4,31 +4,43 @@ use crate::speculative::{
 };
 use crate::sampling::{Sampler, GreedySampler};
 
+/// A collection of raw logit values for the vocabulary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenLogits {
     values: Vec<f32>,
 }
 
+/// Core trait for causal language model backends.
+/// 
+/// This trait provides the interface for both prefill and decode phases,
+/// as well as verification steps for speculative decoding.
 pub trait CausalLmBackend {
+    /// Binds a prefix cache lookup result to the current session.
+    /// This allows the backend to reuse KV-cache pages for prompt prefixes.
     fn bind_prefix_cache(&mut self, _prefix: &CacheLookup) -> Result<()> {
         Ok(())
     }
 
+    /// Binds the backend to a specific inference slot.
     fn bind_slot(&mut self, _slot: crate::slot_manager::SlotId) -> Result<()> {
         Ok(())
     }
 
+    /// Switches the active model weights in the backend.
     fn switch_model(&mut self, _name: &str, _pool: &crate::model_pool::ModelPool) -> Result<()> {
         Ok(())
     }
 
+    /// Performs a single forward pass to get the logits for the next token.
     fn next_logits(&mut self, context: &[TokenId]) -> Result<TokenLogits>;
 
+    /// Samples the next token from the model using the provided sampler.
     fn sample_next(&mut self, context: &[TokenId], sampler: &dyn Sampler) -> Result<NextTokenPrediction> {
         let logits = self.next_logits(context)?;
         Ok(sampler.sample(logits.values(), None))
     }
 
+    /// Performs a batched forward pass for multiple sequences.
     fn next_logits_batch(&mut self, contexts: &[&[TokenId]]) -> Result<Vec<TokenLogits>> {
         contexts
             .iter()
@@ -36,9 +48,12 @@ pub trait CausalLmBackend {
             .collect()
     }
 
+    /// Performs a verification pass for a drafted sequence.
+    /// Returns a list of logits, one for each token in the context + drafted sequence.
     fn verify_logits(&mut self, context: &[TokenId], drafted: &[TokenId])
     -> Result<Vec<TokenLogits>>;
 
+    /// Performs a batched verification pass for multiple drafted sequences.
     fn verify_logits_batch(
         &mut self,
         requests: &[(&[TokenId], &[TokenId])],

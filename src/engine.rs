@@ -36,10 +36,14 @@ impl<R> std::fmt::Debug for VeloEngine<R> {
     }
 }
 
+/// Global configuration for the inference engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineConfig {
+    /// Number of tokens to draft per speculative step.
     pub draft_window: usize,
+    /// Memory limits and resource configuration.
     pub memory: MemoryRuntimeConfig,
+    /// Numerical precision for the KV-cache (e.g. FP32, INT8).
     pub kv_type: KvCacheType,
 }
 
@@ -63,14 +67,14 @@ pub struct EngineOutput {
     pub stats: EngineStats,
 }
 
-/// A request to be processed in a batch.
+/// A request to be processed by the engine.
 #[derive(Debug, Clone)]
 pub struct BatchRequest {
-    /// The prompt tokens.
+    /// The prompt tokens to process.
     pub prompt: Vec<TokenId>,
-    /// Maximum number of new tokens to generate.
+    /// Maximum number of new tokens to generate before stopping.
     pub max_new_tokens: usize,
-    /// Optional grammar/regex constraint.
+    /// Optional structured output constraint (JSON schema, regex, or CFG).
     pub constraint: Option<crate::constraints::Constraint>,
 }
 

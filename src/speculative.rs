@@ -1,19 +1,26 @@
 use crate::radix_cache::{CacheLookup, TokenId};
 
+/// A predicted token and its associated probability/confidence.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NextTokenPrediction {
+    /// The vocabulary ID of the predicted token.
     pub token: TokenId,
+    /// The logit or probability score.
     pub confidence: f32,
 }
 
+/// Verification outcome for a single drafted token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifyStep {
+    /// The token actually produced by the target model.
     pub expected: TokenId,
 }
 
+/// Results of a parallel tree verification pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeVerifyResult {
-    pub expected: Vec<TokenId>, // Target model's expected token for each node in the tree
+    /// The ground-truth tokens predicted by the target model for each node in the speculative tree.
+    pub expected: Vec<TokenId>, 
 }
 
 /// A tree of drafted tokens for parallel verification.
@@ -22,19 +29,24 @@ pub struct SpeculativeTree {
     pub nodes: Vec<TreeNode>,
 }
 
+/// A node within a speculative tree representing a drafted token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TreeNode {
+    /// The drafted token ID.
     pub token: TokenId,
-    pub parent: Option<usize>, // Index of parent node in SpeculativeTree::nodes
+    /// Index of the parent node in the `SpeculativeTree::nodes` array.
+    pub parent: Option<usize>,
 }
 
 impl SpeculativeTree {
+    /// Initializes a new speculative tree with a root token.
     pub fn new(token: TokenId) -> Self {
         Self {
             nodes: vec![TreeNode { token, parent: None }],
         }
     }
 
+    /// Appends a new child token to the specified parent node and returns its index.
     pub fn add_child(&mut self, parent_idx: usize, token: TokenId) -> usize {
         let idx = self.nodes.len();
         self.nodes.push(TreeNode {
@@ -44,7 +56,7 @@ impl SpeculativeTree {
         idx
     }
 
-    /// Returns the sequence of tokens from the root to the given node.
+    /// Reconstructs the sequential path of tokens from the root to the given node index.
     pub fn get_path(&self, mut node_idx: usize) -> Vec<TokenId> {
         let mut path = Vec::new();
         loop {
@@ -95,11 +107,14 @@ impl SpeculativeTree {
     }
 }
 
+/// Interface for the smaller, faster model used to generate speculative token paths.
 pub trait DraftModel {
+    /// Connects the draft model to an existing prefix cache to reuse KV memory.
     fn bind_prefix_cache(&mut self, _prefix: &CacheLookup) -> Result<()> {
         Ok(())
     }
 
+    /// Associates the draft model with a specific execution slot.
     fn bind_slot(&mut self, _slot: crate::slot_manager::SlotId) -> Result<()> {
         Ok(())
     }
@@ -147,19 +162,24 @@ pub trait DraftModel {
     }
 }
 
+/// Interface for the larger, slower model used to verify speculative paths.
 pub trait TargetModel {
+    /// Connects the target model to an existing prefix cache to reuse KV memory.
     fn bind_prefix_cache(&mut self, _prefix: &CacheLookup) -> Result<()> {
         Ok(())
     }
 
+    /// Associates the target model with a specific execution slot.
     fn bind_slot(&mut self, _slot: crate::slot_manager::SlotId) -> Result<()> {
         Ok(())
     }
 
+    /// Switches the active model instance.
     fn switch_model(&mut self, _name: &str, _pool: &crate::model_pool::ModelPool) -> Result<()> {
         Ok(())
     }
 
+    /// Verifies a sequential path of drafted tokens.
     fn verify(
         &mut self,
         context: &[TokenId],
@@ -167,6 +187,7 @@ pub trait TargetModel {
         matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
     ) -> Result<Vec<VerifyStep>>;
 
+    /// Verifies an entire speculative tree in a single batched forward pass.
     fn verify_tree(
         &mut self,
         context: &[TokenId],
