@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use crate::gguf::GgufFile;
 
 /// A simple tokenizer that uses the vocabulary from a GGUF file.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Tokenizer {
     tokens: Vec<String>,
     token_to_id: HashMap<String, u32>,
@@ -96,6 +96,36 @@ impl Tokenizer {
             add_generation_prompt => add_generation_prompt,
         }).map_err(|e| e.to_string())
     }
+}
+
+pub fn dummy_tokenizer() -> crate::tokenizer::Tokenizer {
+    use std::collections::HashMap;
+    let mut tokens = vec![
+        "[UNK]".to_string(), // 0
+        "[BOS]".to_string(), // 1
+        "[EOS]".to_string(), // 2
+        "{".to_string(),
+        "}".to_string(),
+        "\"".to_string(),
+        ":".to_string(),
+        ",".to_string(),
+        "true".to_string(),
+        "false".to_string(),
+        "null".to_string(),
+        "name".to_string(),
+        "age".to_string(),
+        " ".to_string(),
+        "\n".to_string(),
+    ];
+    for i in 0..10 { tokens.push(i.to_string()); }
+    for c in 'a'..='z' { tokens.push(c.to_string()); }
+    
+    let mut token_to_id = HashMap::new();
+    for (i, t) in tokens.iter().enumerate() {
+        token_to_id.insert(t.clone(), i as u32);
+    }
+    
+    crate::tokenizer::Tokenizer { tokens, token_to_id, chat_template: None }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

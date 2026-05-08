@@ -21,6 +21,9 @@ pub trait CfgMatcher: std::fmt::Debug + Send + Sync {
     
     /// Advances the matcher's state by consuming the selected token.
     fn advance(&mut self, token: TokenId);
+
+    /// Clones the matcher to a new Box.
+    fn clone_box(&self) -> Box<dyn CfgMatcher>;
 }
 
 /// A matcher based on llguidance.
@@ -50,21 +53,30 @@ impl LlguidanceMatcher {
 impl CfgMatcher for LlguidanceMatcher {
     fn next_mask(&mut self) -> LogitMask {
         let mut mask = LogitMask::from_elem(false, self.vocab_size);
-        if let Ok(llg_mask) = self.parser.compute_mask_or_eos() {
-            llg_mask.iter_set_entries(|idx| {
-                if idx < self.vocab_size {
-                    mask.set(idx, true);
-                }
-            });
-        } else {
-            // Fallback to allowing everything if masking fails
-            mask.set_all(true);
+        match self.parser.compute_mask_or_eos() {
+            Ok(llg_mask) => {
+                llg_mask.iter_set_entries(|idx| {
+                    if idx < self.vocab_size {
+                        mask.set(idx, true);
+                    }
+                });
+            }
+            Err(_) => {
+                mask.set_all(true);
+            }
         }
         mask
     }
 
     fn advance(&mut self, token: TokenId) {
         let _ = self.parser.consume_token(token);
+    }
+
+    fn clone_box(&self) -> Box<dyn CfgMatcher> {
+        Box::new(LlguidanceMatcher {
+            parser: self.parser.clone(),
+            vocab_size: self.vocab_size,
+        })
     }
 }
 

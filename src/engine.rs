@@ -215,23 +215,34 @@ where
 
             let session = self.decoder.begin(&req.prompt)?;
 
-            let matcher = if let Some(constraint) = req.constraint {
+            let mut matcher = if let Some(constraint) = req.constraint {
                  if let Some(factory) = &self.parser_factory {
                     let grammar = match constraint {
                         crate::constraints::Constraint::Regex(r) => llguidance::api::TopLevelGrammar::from_regex(&r),
                         crate::constraints::Constraint::JsonSchema(j) => llguidance::api::TopLevelGrammar::from_json_schema(j),
                         crate::constraints::Constraint::Lark(l) => llguidance::api::TopLevelGrammar::from_lark(l),
                     };
-                    // TODO: Need vocab_size here.
-                    // Actually, let's assume 32000 for now or get it from somewhere.
-                    // For now, we'll just skip it if we don't have a factory.
-                    crate::constraints::LlguidanceMatcher::new(factory, grammar, 32000).ok().map(|m| Box::new(m) as Box<dyn crate::constraints::CfgMatcher>)
+                    let vocab_size = factory.tok_env().tok_trie().vocab_size() as usize;
+                    match crate::constraints::LlguidanceMatcher::new(factory, grammar, vocab_size) {
+                        Ok(m) => Some(Box::new(m) as Box<dyn crate::constraints::CfgMatcher>),
+                        Err(e) => {
+                            eprintln!("Failed to create LlguidanceMatcher: {}", e);
+                            None
+                        }
+                    }
                  } else {
+                    eprintln!("No parser_factory found in engine");
                     None
                  }
             } else {
                 None
             };
+
+            if let Some(m) = matcher.as_mut() {
+                for &token in &req.prompt {
+                    m.advance(token);
+                }
+            }
 
             active.push(ActiveRequest {
                 session,
@@ -265,13 +276,19 @@ where
 
             // 1. Prepare and execute Draft Batch
             let draft_results = {
+                let mut draft_matchers: Vec<Option<Box<dyn crate::constraints::CfgMatcher>>> = active
+                    .iter()
+                    .map(|req| req.matcher.as_ref().map(|m| m.clone_box()))
+                    .collect();
+
                 let mut draft_reqs: Vec<(&[TokenId], usize, Option<&mut (dyn crate::constraints::CfgMatcher + '_)>)> = active
                     .iter_mut()
-                    .filter(|req| req.generated.len() < req.max_new_tokens)
-                    .map(|req| {
+                    .zip(draft_matchers.iter_mut())
+                    .filter(|(req, _)| req.generated.len() < req.max_new_tokens)
+                    .map(|(req, matcher)| {
                         let remaining = req.max_new_tokens - req.generated.len();
                         let requested = remaining.min(self.decoder.draft_window());
-                        (req.session.context(), requested, req.matcher.as_deref_mut())
+                        (req.session.context(), requested, matcher.as_deref_mut())
                     })
                     .collect();
 

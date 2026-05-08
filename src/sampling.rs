@@ -42,9 +42,13 @@ impl Sampler for GreedySampler {
                 }
             }
             if logit >= max_logit {
+                // if mask.is_some() { println!("  New max: token {} logit {}", i, logit); }
                 max_logit = logit;
                 max_token = i as TokenId;
             }
+        }
+        if mask.is_some() {
+            println!("GreedySampler picked token {} with logit {}", max_token, max_logit);
         }
         NextTokenPrediction {
             token: max_token,

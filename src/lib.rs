@@ -18,6 +18,7 @@ pub mod tokenizer;
 pub mod sampling;
 pub mod model_pool;
 pub mod constraints;
+pub mod ffi;
 
 pub use constraints::{CfgMatcher, Constraint};
 
