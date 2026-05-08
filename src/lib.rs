@@ -27,9 +27,19 @@ pub mod model_pool;
 pub mod constraints;
 pub mod ffi;
 pub mod lora;
+pub mod amx;
+pub mod power;
+pub mod nixl;
 
 pub use constraints::{CfgMatcher, Constraint};
 pub use lora::{AdapterId, LoraRegistry, LoraConfig, LoraWeights};
+pub use amx::AmxContext;
+pub use power::{PowerTelemetry, SmcTelemetry, PrecisionGovernor, PowerState};
+pub use nixl::{
+    build_fabric, deserialize_block, serialize_block,
+    CacheTransferAgent, DmaBlockManager, DmaStats, NixlNodeId, NodeRegistry,
+    RemoteBlock, TransferOutcome, TransferStats, WIRE_HEADER_LEN,
+};
 
 pub use benchmark::{
     compare_with_llama_csv, load_llama_csv, parse_llama_csv, BenchmarkConfig, BenchmarkFormat,
