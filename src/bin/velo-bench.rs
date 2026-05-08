@@ -61,6 +61,8 @@ struct CliArgs {
     llama_csv: Option<PathBuf>,
     kv_type: velo_core::paged_attention::KvCacheType,
     power: bool,
+    model_params: f64,
+    roofline: bool,
 }
 
 impl CliArgs {
@@ -82,6 +84,8 @@ impl CliArgs {
         let mut llama_csv = None;
         let mut kv_type = velo_core::paged_attention::KvCacheType::Fp32;
         let mut power = false;
+        let mut model_params = 8.0;
+        let mut roofline = false;
 
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
@@ -128,6 +132,8 @@ impl CliArgs {
                     };
                 }
                 "--power" => power = true,
+                "--model-params" => model_params = take_value(&mut args, "--model-params")?.parse().map_err(|e| format!("invalid model-params: {e}"))?,
+                "--roofline" => roofline = true,
                 "--help" | "-h" => return Err(Self::help()),
                 other => return Err(format!("unrecognized argument: {other}")),
             }
@@ -151,6 +157,8 @@ impl CliArgs {
             llama_csv,
             kv_type,
             power,
+            model_params,
+            roofline,
         })
     }
 
@@ -193,6 +201,8 @@ impl CliArgs {
             model_name: self.model_name.clone(),
             backend_name: self.backend_name.clone(),
             measure_power: self.power,
+            model_params_billions: self.model_params,
+            roofline: self.roofline,
         }
     }
 
@@ -306,7 +316,7 @@ mod tests {
             format: BenchmarkFormat::Markdown,
             llama_csv: None,
             kv_type: velo_core::paged_attention::KvCacheType::Fp32,
-            power: false,
+            power: false, model_params: 8.0, roofline: false,
         };
         let modes = args.modes();
         assert_eq!(modes.len(), 3);
@@ -332,7 +342,7 @@ mod tests {
             format: BenchmarkFormat::Markdown,
             llama_csv: None,
             kv_type: velo_core::paged_attention::KvCacheType::Fp32,
-            power: false,
+            power: false, model_params: 8.0, roofline: false,
         };
         let cfg = args.benchmark_config(BenchmarkMode::PromptProcessing);
         assert_eq!(cfg.prompt_len, 128);

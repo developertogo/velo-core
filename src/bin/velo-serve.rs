@@ -60,6 +60,16 @@ struct ChatStreamResponse {
     created: u64,
     model: String,
     choices: Vec<ChatStreamChoice>,
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatUsage {
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_tokens: usize,
+    energy_uj: Option<u128>,
+    hardware_utilization: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,18 +169,27 @@ async fn main() -> anyhow::Result<()> {
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, String> {
+) -> Result<(axum::http::HeaderMap, Sse<impl Stream<Item = Result<Event, Infallible>>>), String> {
     // 1. Apply Chat Template (Flexible)
     let messages_json = serde_json::to_value(&req.messages).map_err(|e| e.to_string())?;
     let messages_slice = messages_json.as_array().ok_or("Failed to convert messages to array")?;
     let prompt = state.tokenizer.apply_chat_template(messages_slice, true)?;
 
     let token_ids = state.tokenizer.encode(&prompt);
+    let prompt_len = token_ids.len();
     let (mut token_rx, _done_rx) = state.scheduler.submit(token_ids, req.max_tokens);
 
     let tokenizer = state.tokenizer.clone();
-   
+    let specs = velo_core::HardwareSpecs::detect();
+    
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("X-Velo-Hardware-Peak-GBs", specs.peak_bw_gb_s.to_string().parse().unwrap());
+    headers.insert("X-Velo-Hardware-Peak-TFLOPS", specs.peak_tflops.to_string().parse().unwrap());
+    
     let stream = async_stream::stream! {
+        let prompt_tokens = prompt_len;
+        let mut completion_tokens = 0;
+        let started = std::time::Instant::now();
         while let Some(res) = token_rx.recv().await {
             let token = match res {
                 Ok(t) => t,
@@ -190,10 +209,26 @@ async fn chat_completions(
                     delta: ChatDelta { content: Some(text) },
                     finish_reason: None,
                 }],
+                usage: None,
             };
+            completion_tokens += 1;
             yield Ok(Event::default().data(serde_json::to_string(&resp).unwrap()));
         }
        
+        let elapsed_ns = started.elapsed().as_nanos();
+        let total_tokens = prompt_tokens + completion_tokens;
+        
+        // Naive utilization estimate for telemetry
+        let util = if elapsed_ns > 0 {
+             // Weights (8B Q4) + KV etc. Roughly 4.5 GB read per token
+             let bytes_per_token = 4.5e9;
+             let total_bytes = completion_tokens as f64 * bytes_per_token;
+             let gb_s = (total_bytes / 1e9) / (elapsed_ns as f64 / 1e9);
+             Some(gb_s / specs.peak_bw_gb_s)
+        } else {
+             None
+        };
+
         let final_resp = ChatStreamResponse {
             id: "velo-123".into(),
             object: "chat.completion.chunk".into(),
@@ -204,11 +239,18 @@ async fn chat_completions(
                 delta: ChatDelta { content: None },
                 finish_reason: Some("stop".into()),
             }],
+            usage: Some(ChatUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                energy_uj: None, // Hard to measure per-request in scheduler
+                hardware_utilization: util,
+            }),
         };
         yield Ok(Event::default().data(serde_json::to_string(&final_resp).unwrap()));
     };
 
-    Ok(Sse::new(stream))
+    Ok((headers, Sse::new(stream)))
 }
 
 async fn list_models() -> Json<serde_json::Value> {
@@ -297,5 +339,63 @@ mod tests {
 
         let prompt = tokenizer.apply_chat_template(&messages, true).unwrap();
         assert_eq!(prompt, "Hello");
+    }
+
+    #[test]
+    fn test_default_max_tokens() {
+        assert_eq!(default_max_tokens(), 128);
+    }
+
+    #[test]
+    fn test_chat_stream_response_serialization() {
+        let resp = ChatStreamResponse {
+            id: "id-1".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "test".into(),
+            choices: vec![ChatStreamChoice {
+                index: 0,
+                delta: ChatDelta { content: Some("hello".into()) },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("hello"));
+        assert!(json.contains("chat.completion.chunk"));
+    }
+
+    #[test]
+    fn test_chat_usage_serialization() {
+        let usage = ChatUsage {
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            total_tokens: 30,
+            energy_uj: Some(1000),
+            hardware_utilization: Some(0.75),
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("\"prompt_tokens\":10"));
+        assert!(json.contains("0.75"));
+    }
+
+    #[test]
+    fn test_chat_message_roundtrip() {
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.role, "user");
+        assert_eq!(back.content, "hi");
+    }
+
+    #[test]
+    fn test_chat_completion_request_defaults() {
+        let json = r#"{"messages":[]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.max_tokens, 128);
+        assert!(!req.stream);
     }
 }

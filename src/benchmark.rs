@@ -24,7 +24,7 @@ pub enum BenchmarkFormat {
     Json,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BenchmarkConfig {
     pub mode: BenchmarkMode,
     pub prompt_len: usize,
@@ -40,6 +40,8 @@ pub struct BenchmarkConfig {
     pub model_name: String,
     pub backend_name: String,
     pub measure_power: bool,
+    pub model_params_billions: f64,
+    pub roofline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +53,8 @@ pub struct BenchmarkSample {
     pub cache_miss_tokens: usize,
     pub speculative: SpeculativeStats,
     pub energy_uj: Option<u128>,
+    pub achieved_gb_s: Option<f64>,
+    pub achieved_tflops: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +87,9 @@ pub struct BenchmarkRow {
     pub joules_per_token: Option<f64>,
     pub baseline_avg_ts: Option<f64>,
     pub speedup_vs_baseline: Option<f64>,
+    pub achieved_gb_s: Option<f64>,
+    pub achieved_tflops: Option<f64>,
+    pub bw_utilization: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +104,65 @@ pub struct LlamaBenchRow {
     pub stddev_ns: u128,
     pub avg_ts: f64,
     pub stddev_ts: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HardwareSpecs {
+    pub peak_bw_gb_s: f64,
+    pub peak_tflops: f64,
+}
+
+impl HardwareSpecs {
+    pub fn detect() -> Self {
+        // Default to a conservative M1/M2/M3 base if detection fails
+        let mut specs = HardwareSpecs {
+            peak_bw_gb_s: 100.0,
+            peak_tflops: 5.0,
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::process::Command;
+            let output = Command::new("sysctl")
+                .arg("-n")
+                .arg("machdep.cpu.brand_string")
+                .output();
+
+            if let Ok(out) = output {
+                let brand = String::from_utf8_lossy(&out.stdout).to_lowercase();
+                if brand.contains("m1 ultra") {
+                    specs.peak_bw_gb_s = 800.0;
+                    specs.peak_tflops = 21.0;
+                } else if brand.contains("m1 max") {
+                    specs.peak_bw_gb_s = 400.0;
+                    specs.peak_tflops = 10.4;
+                } else if brand.contains("m1 pro") {
+                    specs.peak_bw_gb_s = 200.0;
+                    specs.peak_tflops = 5.2;
+                } else if brand.contains("m2 ultra") {
+                    specs.peak_bw_gb_s = 800.0;
+                    specs.peak_tflops = 27.2;
+                } else if brand.contains("m2 max") {
+                    specs.peak_bw_gb_s = 400.0;
+                    specs.peak_tflops = 13.6;
+                } else if brand.contains("m2 pro") {
+                    specs.peak_bw_gb_s = 200.0;
+                    specs.peak_tflops = 6.8;
+                } else if brand.contains("m3 max") {
+                    specs.peak_bw_gb_s = 400.0; // Some M3 Max are 300, some 400
+                    specs.peak_tflops = 18.0;
+                } else if brand.contains("m3 pro") {
+                    specs.peak_bw_gb_s = 150.0;
+                    specs.peak_tflops = 9.0;
+                } else if brand.contains("m3") {
+                    specs.peak_bw_gb_s = 100.0;
+                    specs.peak_tflops = 5.0;
+                }
+            }
+        }
+
+        specs
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -264,6 +330,12 @@ pub fn run_single_case(
 
     let energy_uj = monitor.stop();
 
+    let (achieved_gb_s, achieved_tflops) = if config.roofline {
+        estimate_metrics(config, tokens, elapsed_ns)
+    } else {
+        (None, None)
+    };
+
     Ok(BenchmarkSample {
         elapsed_ns,
         ttft_ns,
@@ -272,7 +344,63 @@ pub fn run_single_case(
         cache_miss_tokens,
         speculative,
         energy_uj,
+        achieved_gb_s,
+        achieved_tflops,
     })
+}
+
+fn estimate_metrics(
+    config: &BenchmarkConfig,
+    tokens: usize,
+    elapsed_ns: u128,
+) -> (Option<f64>, Option<f64>) {
+    if elapsed_ns == 0 {
+        return (None, None);
+    }
+    let seconds = elapsed_ns as f64 / 1e9;
+
+    // Weights size estimate: Q4_0 is ~0.5 bytes per parameter
+    let weight_bytes = config.model_params_billions * 1e9 * 0.5;
+
+    // KV Cache estimate (Llama-3 8B style): 128 tokens * layers * heads * dim * bytes
+    // Llama-3 8B: 32 layers, 32 heads, 128 dim. KV = 32 * 32 * 128 * 2 (K+V) * 2 (FP16) = 524,288 bytes/token.
+    let kv_bytes_per_token = 524288.0;
+
+    let total_bytes = match config.mode {
+        BenchmarkMode::PromptProcessing => {
+            // Read Weights + Write KV
+            weight_bytes + (config.prompt_len as f64 * kv_bytes_per_token)
+        }
+        BenchmarkMode::Generation => {
+            // For each token: Read Weights + Read existing KV + Write new KV
+            let gen_len = config.gen_len as f64;
+            let prompt_len = config.prompt_len as f64;
+            let weights_read = gen_len * weight_bytes;
+            let kv_read =
+                (gen_len * prompt_len + (gen_len * (gen_len - 1.0) / 2.0)) * kv_bytes_per_token;
+            let kv_write = gen_len * kv_bytes_per_token;
+            weights_read + kv_read + kv_write
+        }
+        BenchmarkMode::PromptPlusGeneration => {
+            // Prompt path + Generation path
+            let pp_bytes = weight_bytes + (config.prompt_len as f64 * kv_bytes_per_token);
+            let gen_len = config.gen_len as f64;
+            let prompt_len = config.prompt_len as f64;
+            let weights_read = gen_len * weight_bytes;
+            let kv_read =
+                (gen_len * prompt_len + (gen_len * (gen_len - 1.0) / 2.0)) * kv_bytes_per_token;
+            let kv_write = gen_len * kv_bytes_per_token;
+            pp_bytes + weights_read + kv_read + kv_write
+        }
+    };
+
+    let gb_s = (total_bytes / 1e9) / seconds;
+
+    // FLOPs estimate: 2 FLOPs per parameter per token
+    let total_flops = 2.0 * config.model_params_billions * 1e9 * tokens as f64;
+    let tflops = (total_flops / 1e12) / seconds;
+
+    (Some(gb_s), Some(tflops))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -456,6 +584,24 @@ fn summarize(config: &BenchmarkConfig, samples: &[BenchmarkSample]) -> Benchmark
         },
         baseline_avg_ts: None,
         speedup_vs_baseline: None,
+        achieved_gb_s: {
+            let values = samples.iter().filter_map(|s| s.achieved_gb_s).collect::<Vec<_>>();
+            (!values.is_empty()).then(|| mean(&values))
+        },
+        achieved_tflops: {
+            let values = samples.iter().filter_map(|s| s.achieved_tflops).collect::<Vec<_>>();
+            (!values.is_empty()).then(|| mean(&values))
+        },
+        bw_utilization: {
+            let values = samples.iter().filter_map(|s| s.achieved_gb_s).collect::<Vec<_>>();
+            if values.is_empty() {
+                None
+            } else {
+                let avg_gb_s = mean(&values);
+                let specs = HardwareSpecs::detect();
+                Some(avg_gb_s / specs.peak_bw_gb_s)
+            }
+        },
     }
 }
 
@@ -677,9 +823,9 @@ impl BenchmarkReport {
 
         let mut out = String::new();
         out.push_str(
-            "| test | model | backend | t/s | ttft ns | power W | t/J | J/t | cache hit | speedup |\n",
+            "| test | model | backend | t/s | ttft ns | power W | t/J | GB/s | TFLOPS | util % | cache hit | speedup |\n",
         );
-        out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
         for row in &rows {
             let ttft = row
                 .avg_ttft_ns
@@ -691,9 +837,12 @@ impl BenchmarkReport {
                 .unwrap_or_else(|| "-".to_string());
             let power = row.avg_power_w.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".to_string());
             let tpj = row.tokens_per_joule.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".to_string());
-            let jpt = row.joules_per_token.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".to_string());
+            let gb_s = row.achieved_gb_s.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".to_string());
+            let tflops = row.achieved_tflops.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".to_string());
+            let util = row.bw_utilization.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_else(|| "-".to_string());
+
             out.push_str(&format!(
-                "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {:.2} | {} |\n",
+                "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {:.2} | {} |\n",
                 row.test,
                 row.model_name,
                 row.backend_name,
@@ -701,8 +850,10 @@ impl BenchmarkReport {
                 ttft,
                 power,
                 tpj,
-                jpt,
-                row.avg_cache_hit_tokens,
+                gb_s,
+                tflops,
+                util,
+                row.avg_cache_hit_tokens / (row.avg_cache_hit_tokens + row.avg_cache_miss_tokens),
                 speedup
             ));
         }
@@ -711,7 +862,7 @@ impl BenchmarkReport {
 
     pub fn to_csv(&self) -> String {
         let mut out = String::new();
-        out.push_str("model_name,backend_name,test,mode,prompt_len,gen_len,cached_depth,repetitions,warmups,avg_ns,stddev_ns,p50_ns,p90_ns,p99_ns,avg_ts,stddev_ts,avg_ttft_ns,avg_power_w,tokens_per_joule,joules_per_token,avg_cache_hit_tokens,avg_cache_miss_tokens,avg_draft_calls,avg_target_calls,avg_accepted_tokens,avg_rejected_tokens,baseline_avg_ts,speedup_vs_baseline\n");
+        out.push_str("model_name,backend_name,test,mode,prompt_len,gen_len,cached_depth,repetitions,warmups,avg_ns,stddev_ns,p50_ns,p90_ns,p99_ns,avg_ts,stddev_ts,avg_ttft_ns,avg_power_w,tokens_per_joule,joules_per_token,achieved_gb_s,achieved_tflops,bw_utilization,avg_cache_hit_tokens,avg_cache_miss_tokens,avg_draft_calls,avg_target_calls,avg_accepted_tokens,avg_rejected_tokens,baseline_avg_ts,speedup_vs_baseline\n");
         for row in &self.rows {
             let ttft = row
                 .avg_ttft_ns
@@ -725,8 +876,11 @@ impl BenchmarkReport {
             let power = row.avg_power_w.map_or(String::new(), |v| v.to_string());
             let tpj = row.tokens_per_joule.map_or(String::new(), |v| v.to_string());
             let jpt = row.joules_per_token.map_or(String::new(), |v| v.to_string());
+            let gb_s = row.achieved_gb_s.map_or(String::new(), |v| v.to_string());
+            let tflops = row.achieved_tflops.map_or(String::new(), |v| v.to_string());
+            let util = row.bw_utilization.map_or(String::new(), |v| v.to_string());
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{:.0},{:.6},{:.0},{:.0},{:.0},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{:.0},{:.6},{:.0},{:.0},{:.0},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 row.model_name,
                 row.backend_name,
                 row.test,
@@ -747,6 +901,9 @@ impl BenchmarkReport {
                 power,
                 tpj,
                 jpt,
+                gb_s,
+                tflops,
+                util,
                 row.avg_cache_hit_tokens,
                 row.avg_cache_miss_tokens,
                 row.avg_draft_calls,
@@ -767,7 +924,7 @@ impl BenchmarkReport {
                 out.push(',');
             }
             out.push_str(&format!(
-                "{{\"model_name\":\"{}\",\"backend_name\":\"{}\",\"test\":\"{}\",\"mode\":\"{}\",\"prompt_len\":{},\"gen_len\":{},\"cached_depth\":{},\"repetitions\":{},\"warmups\":{},\"avg_ns\":{:.0},\"stddev_ns\":{:.6},\"p50_ns\":{:.0},\"p90_ns\":{:.0},\"p99_ns\":{:.0},\"avg_ts\":{:.6},\"stddev_ts\":{:.6},\"avg_ttft_ns\":{},\"avg_power_w\":{},\"tokens_per_joule\":{},\"joules_per_token\":{},\"avg_cache_hit_tokens\":{:.6},\"avg_cache_miss_tokens\":{:.6},\"avg_draft_calls\":{:.6},\"avg_target_calls\":{:.6},\"avg_accepted_tokens\":{:.6},\"avg_rejected_tokens\":{:.6},\"baseline_avg_ts\":{},\"speedup_vs_baseline\":{}}}",
+                "{{\"model_name\":\"{}\",\"backend_name\":\"{}\",\"test\":\"{}\",\"mode\":\"{}\",\"prompt_len\":{},\"gen_len\":{},\"cached_depth\":{},\"repetitions\":{},\"warmups\":{},\"avg_ns\":{:.0},\"stddev_ns\":{:.6},\"p50_ns\":{:.0},\"p90_ns\":{:.0},\"p99_ns\":{:.0},\"avg_ts\":{:.6},\"stddev_ts\":{:.6},\"avg_ttft_ns\":{},\"avg_power_w\":{},\"tokens_per_joule\":{},\"joules_per_token\":{},\"avg_cache_hit_tokens\":{:.6},\"avg_cache_miss_tokens\":{:.6},\"avg_draft_calls\":{:.6},\"avg_target_calls\":{:.6},\"avg_accepted_tokens\":{:.6},\"avg_rejected_tokens\":{:.6},\"baseline_avg_ts\":{},\"speedup_vs_baseline\":{},\"achieved_gb_s\":{},\"achieved_tflops\":{},\"bw_utilization\":{}}}",
                 row.model_name,
                 row.backend_name,
                 row.test,
@@ -796,6 +953,9 @@ impl BenchmarkReport {
                 row.avg_rejected_tokens,
                 row.baseline_avg_ts.map_or_else(|| "null".to_string(), |v| v.to_string()),
                 row.speedup_vs_baseline.map_or_else(|| "null".to_string(), |v| v.to_string()),
+                row.achieved_gb_s.map_or_else(|| "null".to_string(), |v| v.to_string()),
+                row.achieved_tflops.map_or_else(|| "null".to_string(), |v| v.to_string()),
+                row.bw_utilization.map_or_else(|| "null".to_string(), |v| v.to_string()),
             ));
         }
         out.push(']');
@@ -859,6 +1019,9 @@ mod tests {
             joules_per_token: None,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
+            achieved_gb_s: None,
+            achieved_tflops: None,
+            bw_utilization: None,
         };
         let report = BenchmarkReport { rows: vec![row] };
         let md = report.to_markdown();
@@ -897,6 +1060,9 @@ mod tests {
             joules_per_token: None,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
+            achieved_gb_s: None,
+            achieved_tflops: None,
+            bw_utilization: None,
         };
         let report = BenchmarkReport { rows: vec![row] };
         let json = report.to_json();
@@ -955,6 +1121,9 @@ mod tests {
             joules_per_token: None,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
+            achieved_gb_s: None,
+            achieved_tflops: None,
+            bw_utilization: None,
         }];
 
         let csv = "build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,split_mode,main_gpu,no_kv_offload,flash_attn,tensor_split,use_mmap,embeddings,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts\n\
@@ -975,23 +1144,25 @@ mod tests {
 
         let config = BenchmarkConfig {
             mode: BenchmarkMode::PromptProcessing,
-            prompt_len: 8,
+            prompt_len: 128,
             gen_len: 0,
             cached_depth: 0,
             repetitions: 1,
             warmups: 0,
-            draft_window: 1,
+            draft_window: 8,
             bytes_per_token: 0,
             page_tokens: 16,
-            total_pages: 32,
-            quantization: crate::metal::Quantization::F32,
-            model_name: "test".into(),
-            backend_name: "cpu".into(),
+            total_pages: 1024,
+            quantization: Quantization::Q4_0,
+            model_name: "test".to_string(),
+            backend_name: "test".to_string(),
             measure_power: false,
+            model_params_billions: 0.0,
+            roofline: false,
         };
 
         let sample = run_single_case(&engine_config, &config).unwrap();
-        assert_eq!(sample.tokens, 8);
+        assert_eq!(sample.tokens, 128);
         assert!(sample.elapsed_ns > 0);
     }
 
@@ -1026,6 +1197,9 @@ mod tests {
             joules_per_token: None,
             baseline_avg_ts: None,
             speedup_vs_baseline: None,
+            achieved_gb_s: None,
+            achieved_tflops: None,
+            bw_utilization: None,
         };
         assert_eq!(row.tokens_processed(), 10);
         row.mode = BenchmarkMode::Generation;
@@ -1065,6 +1239,9 @@ mod tests {
             joules_per_token: None,
             baseline_avg_ts: Some(800.0),
             speedup_vs_baseline: Some(1.25),
+            achieved_gb_s: None,
+            achieved_tflops: None,
+            bw_utilization: None,
         };
         let report = BenchmarkReport { rows: vec![row] };
         let csv = report.to_csv();
@@ -1133,6 +1310,8 @@ mod tests {
             model_name: "test".into(),
             backend_name: "cpu".into(),
             measure_power: false,
+            model_params_billions: 0.0,
+            roofline: false,
         };
         let report = run_benchmark(&engine_config, &config).unwrap();
         assert_eq!(report.rows.len(), 1);
@@ -1162,6 +1341,8 @@ mod tests {
             model_name: "test".into(),
             backend_name: "cpu".into(),
             measure_power: false,
+            model_params_billions: 0.0,
+            roofline: false,
         };
 
         let sample = run_single_case(&engine_config, &config).unwrap();
@@ -1192,6 +1373,8 @@ mod tests {
             model_name: "test".into(),
             backend_name: "cpu".into(),
             measure_power: false,
+            model_params_billions: 0.0,
+            roofline: false,
         };
 
         let sample = run_single_case(&engine_config, &config).unwrap();
@@ -1256,9 +1439,12 @@ mod tests {
             joules_per_token: None,
             baseline_avg_ts: Some(5.0),
             speedup_vs_baseline: Some(2.0),
+            achieved_gb_s: None,
+            achieved_tflops: None,
+            bw_utilization: None,
         };
         let report = BenchmarkReport { rows: vec![row] };
         let csv = report.to_csv();
-        assert!(csv.contains("50,,,,0,1,0,0,0,0,5,2"));
+        assert!(csv.contains("50,,,,,,,0,1,0,0,0,0,5,2"));
     }
 }

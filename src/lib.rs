@@ -24,7 +24,7 @@ pub use constraints::{CfgMatcher, Constraint};
 pub use benchmark::{
     compare_with_llama_csv, load_llama_csv, parse_llama_csv, BenchmarkConfig, BenchmarkFormat,
     BenchmarkMode, BenchmarkReport, BenchmarkRow, BenchmarkSample, LlamaBenchRow,
-    run_benchmark, run_single_case,
+    run_benchmark, run_single_case, HardwareSpecs,
 };
 pub use backend::{CausalLmBackend, GreedyDraftModel, GreedyTargetModel, TokenLogits};
 pub use sampling::{GreedySampler, Sampler, TopPSampler, MinPSampler};

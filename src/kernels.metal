@@ -155,7 +155,30 @@ kernel void softmax(
 
 // ── Attention Kernels ─────────────────────────────────────────────────────────
 
-kernel void paged_attention_fused(
+/**
+ * Flash Attention 2 for Paged KV Cache (FP32).
+ * 
+ * Implements the online softmax algorithm with one-pass tiling to minimize 
+ * memory round-trips. O(1) memory overhead per head.
+ * 
+ * Supports Grouped Query Attention (GQA) by mapping multiple query heads
+ * to a single KV head using: kv_head_idx = head_idx / (n_head / n_head_kv).
+ * 
+ * @param out           Output buffer for attention results [n_head, head_dim]
+ * @param q             Query buffer for the current token [n_head, head_dim]
+ * @param k_cache       Global KV cache pool for keys
+ * @param v_cache       Global KV cache pool for values
+ * @param head_dim      Dimensionality of each attention head
+ * @param n_ctx         Total context length (not used in tiling loop)
+ * @param pos           Current position of the token being generated
+ * @param slot_id       ID of the active inference slot
+ * @param slot_mapping  Buffer mapping slots to physical KV pages
+ * @param max_pages     Total number of pages in the pool
+ * @param block_size    Number of tokens per KV page
+ * @param n_head_kv     Number of KV heads (for GQA)
+ * @param n_head        Number of query heads
+ */
+kernel void paged_attention_flash(
     device float* out [[buffer(0)]],
     device const float* q [[buffer(1)]],
     device const float* k_cache [[buffer(2)]],
@@ -168,57 +191,53 @@ kernel void paged_attention_fused(
     constant uint& max_pages [[buffer(9)]],
     constant uint& block_size [[buffer(10)]],
     constant uint& n_head_kv [[buffer(11)]],
-    uint tpig [[thread_position_in_grid]] // thread per head
+    constant uint& n_head [[buffer(12)]],
+    uint head_idx [[thread_position_in_grid]]
 ) {
-    uint head_idx = tpig;
+    uint kv_head_idx = head_idx / (n_head / n_head_kv);
     device const float* head_q = q + head_idx * head_dim;
     device float* head_out = out + head_idx * head_dim;
 
-    // We'll use threadgroup memory for scores if possible, but n_ctx can be large.
-    // For now, we'll calculate scores on the fly or use a local array.
-    // Given MSL limits, we'll do a two-pass approach within the kernel if n_ctx is small,
-    // or just calculate on the fly for the second pass.
-    
     float inv_sqrt_head_dim = 1.0f / sqrt((float)head_dim);
-    float max_score = -INFINITY;
     
-    // Pass 1: Scores + Max
-    // We'll use a fixed-size local buffer for scores to support reasonable context lengths.
-    // For very large contexts, we'd need a different approach.
-    float scores[1024]; // Support up to 1024 context in fused kernel for now
-    uint limit = min(pos + 1, 1024u);
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[128]; // Supporting head_dim up to 128
+    for (uint i = 0; i < head_dim; i++) acc[i] = 0.0f;
 
-    for (uint t = 0; t < limit; t++) {
-        float sum = 0.0f;
+    uint total_tokens = pos + 1;
+
+    // Flash Attention 2: One-pass tiling with online softmax
+    for (uint t = 0; t < total_tokens; t++) {
+        // 1. Fetch Key
         uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
         uint token_in_block = t % block_size;
-        device const float* head_k = k_cache + (block_idx * block_size * n_head_kv * head_dim) + (token_in_block * n_head_kv * head_dim) + (head_idx * head_dim);
+        device const float* head_k = k_cache + (block_idx * block_size * n_head_kv * head_dim) + (token_in_block * n_head_kv * head_dim) + (kv_head_idx * head_dim);
+        
+        // 2. Compute Score
+        float score = 0.0f;
         for (uint d = 0; d < head_dim; d++) {
-            sum += head_q[d] * head_k[d];
+            score += head_q[d] * head_k[d];
         }
-        float score = sum * inv_sqrt_head_dim;
-        scores[t] = score;
-        max_score = max(max_score, score);
+        score *= inv_sqrt_head_dim;
+
+        // 3. Online Softmax update
+        float m_old = m;
+        m = max(m_old, score);
+        float exp_score = exp(score - m);
+        float exp_m_diff = exp(m_old - m);
+        l = l * exp_m_diff + exp_score;
+
+        // 4. Accumulate Weighted Value
+        device const float* head_v = v_cache + (block_idx * block_size * n_head_kv * head_dim) + (token_in_block * n_head_kv * head_dim) + (kv_head_idx * head_dim);
+        for (uint d = 0; d < head_dim; d++) {
+            acc[d] = acc[d] * exp_m_diff + exp_score * head_v[d];
+        }
     }
 
-    // Softmax
-    float exp_sum = 0.0f;
-    for (uint t = 0; t < limit; t++) {
-        scores[t] = exp(scores[t] - max_score);
-        exp_sum += scores[t];
-    }
-    float inv_exp_sum = 1.0f / exp_sum;
-
-    // Pass 2: Accumulate Values
+    // 5. Finalize output
     for (uint d = 0; d < head_dim; d++) {
-        float sum = 0.0f;
-        for (uint t = 0; t < limit; t++) {
-            uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
-            uint token_in_block = t % block_size;
-            device const float* head_v = v_cache + (block_idx * block_size * n_head_kv * head_dim) + (token_in_block * n_head_kv * head_dim) + (head_idx * head_dim);
-            sum += (scores[t] * inv_exp_sum) * head_v[d];
-        }
-        head_out[d] = sum;
+        head_out[d] = acc[d] / l;
     }
 }
 
@@ -253,7 +272,7 @@ kernel void kv_update(
 // ── Quantized Attention (INT8) ────────────────────────────────────────────────
 // Cache layout: [Block][Token][Head][Dim] where Dim is char[head_dim] + float scale
 
-kernel void paged_attention_fused_int8(
+kernel void paged_attention_flash_int8(
     device float* out [[buffer(0)]],
     device const float* q [[buffer(1)]],
     device const char* k_cache [[buffer(2)]],
@@ -266,55 +285,52 @@ kernel void paged_attention_fused_int8(
     constant uint& max_pages [[buffer(9)]],
     constant uint& block_size [[buffer(10)]],
     constant uint& n_head_kv [[buffer(11)]],
-    uint tpig [[thread_position_in_grid]]
+    constant uint& n_head [[buffer(12)]],
+    uint head_idx [[thread_position_in_grid]]
 ) {
-    uint head_idx = tpig;
+    uint kv_head_idx = head_idx / (n_head / n_head_kv);
     device const float* head_q = q + head_idx * head_dim;
     device float* head_out = out + head_idx * head_dim;
 
     float inv_sqrt_head_dim = 1.0f / sqrt((float)head_dim);
-    float max_score = -INFINITY;
-    float scores[1024];
-    uint limit = min(pos + 1, 1024u);
-
-    // Byte size of one head in cache: head_dim bytes + 4 bytes scale
     uint head_bytes = head_dim + 4;
+    
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[128];
+    for (uint i = 0; i < head_dim; i++) acc[i] = 0.0f;
 
-    for (uint t = 0; t < limit; t++) {
-        float sum = 0.0f;
+    uint total_tokens = pos + 1;
+
+    for (uint t = 0; t < total_tokens; t++) {
         uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
         uint token_in_block = t % block_size;
         
-        device const char* k_head_ptr = k_cache + (block_idx * block_size * n_head_kv * head_bytes) + (token_in_block * n_head_kv * head_bytes) + (head_idx * head_bytes);
+        device const char* k_head_ptr = k_cache + (block_idx * block_size * n_head_kv * head_bytes) + (token_in_block * n_head_kv * head_bytes) + (kv_head_idx * head_bytes);
         float k_scale = *(device const float*)(k_head_ptr + head_dim);
 
+        float score = 0.0f;
         for (uint d = 0; d < head_dim; d++) {
-            sum += head_q[d] * ((float)k_head_ptr[d] * k_scale);
+            score += head_q[d] * ((float)k_head_ptr[d] * k_scale);
         }
-        float score = sum * inv_sqrt_head_dim;
-        scores[t] = score;
-        max_score = max(max_score, score);
-    }
+        score *= inv_sqrt_head_dim;
 
-    float exp_sum = 0.0f;
-    for (uint t = 0; t < limit; t++) {
-        scores[t] = exp(scores[t] - max_score);
-        exp_sum += scores[t];
+        float m_old = m;
+        m = max(m_old, score);
+        float exp_score = exp(score - m);
+        float exp_m_diff = exp(m_old - m);
+        l = l * exp_m_diff + exp_score;
+
+        device const char* v_head_ptr = v_cache + (block_idx * block_size * n_head_kv * head_bytes) + (token_in_block * n_head_kv * head_bytes) + (kv_head_idx * head_bytes);
+        float v_scale = *(device const float*)(v_head_ptr + head_dim);
+        
+        for (uint d = 0; d < head_dim; d++) {
+            acc[d] = acc[d] * exp_m_diff + exp_score * ((float)v_head_ptr[d] * v_scale);
+        }
     }
-    float inv_exp_sum = 1.0f / exp_sum;
 
     for (uint d = 0; d < head_dim; d++) {
-        float sum = 0.0f;
-        for (uint t = 0; t < limit; t++) {
-            uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
-            uint token_in_block = t % block_size;
-            
-            device const char* v_head_ptr = v_cache + (block_idx * block_size * n_head_kv * head_bytes) + (token_in_block * n_head_kv * head_bytes) + (head_idx * head_bytes);
-            float v_scale = *(device const float*)(v_head_ptr + head_dim);
-            
-            sum += (scores[t] * inv_exp_sum) * ((float)v_head_ptr[d] * v_scale);
-        }
-        head_out[d] = sum;
+        head_out[d] = acc[d] / l;
     }
 }
 
@@ -377,4 +393,62 @@ kernel void vec_add(
     uint tpig [[thread_position_in_grid]]
 ) {
     x[tpig] += y[tpig];
+}
+
+// ── Sampling (ArgMax) ─────────────────────────────────────────────────────────
+
+/**
+ * Parallel ArgMax Reduction for GPU-Resident Sampling.
+ * 
+ * Finds the token index with the highest logit value using a threadgroup-level
+ * reduction with SIMD shuffle primitives.
+ * 
+ * @param out_token      Result buffer for the winning TokenId
+ * @param logits         Input logit buffer [n_vocab]
+ * @param n              Vocab size (n_vocab)
+ */
+kernel void argmax(
+    device uint* out_token [[buffer(0)]],
+    device const float* logits [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint tpig [[thread_position_in_grid]],
+    uint tisl [[thread_index_in_simdgroup]],
+    uint simds_per_tg [[simdgroups_per_threadgroup]],
+    uint tpitg [[thread_position_in_threadgroup]],
+    uint sidx [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float local_max[32]; 
+    threadgroup uint local_idx[32];
+    
+    float val = (tpig < n) ? logits[tpig] : -INFINITY;
+    uint idx = tpig;
+    
+    // SIMD-level reduction
+    for (uint offset = 16; offset > 0; offset /= 2) {
+        float other_val = simd_shuffle_down(val, offset);
+        uint other_idx = simd_shuffle_down(idx, offset);
+        if (other_val > val) {
+            val = other_val;
+            idx = other_idx;
+        }
+    }
+    
+    if (tisl == 0) {
+        local_max[sidx] = val;
+        local_idx[sidx] = idx;
+    }
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    if (tpitg == 0) {
+        float final_max = -INFINITY;
+        uint final_idx = 0;
+        for (uint i = 0; i < simds_per_tg; i++) {
+            if (local_max[i] > final_max) {
+                final_max = local_max[i];
+                final_idx = local_idx[i];
+            }
+        }
+        *out_token = final_idx;
+    }
 }

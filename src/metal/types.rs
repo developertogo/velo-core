@@ -131,5 +131,35 @@ mod tests {
     fn test_metal_error_display() {
         let err = MetalError::LibraryError("failed".into());
         assert_eq!(format!("{}", err), "Metal library error: failed");
+        
+        let err2 = MetalError::DeviceNotFound;
+        assert_eq!(format!("{}", err2), "Metal device not found");
+        
+        let err3 = MetalError::PipelineError("test".into());
+        assert_eq!(format!("{}", err3), "Metal pipeline error: test");
+    }
+
+    #[test]
+    fn test_metal_device_info_traits() {
+        let info = MetalDeviceInfo {
+            name: "test".to_string(),
+            unified_memory: true,
+        };
+        assert_eq!(info.name, "test");
+        assert!(info.unified_memory);
+        assert!(format!("{:?}", info).contains("MetalDeviceInfo"));
+        
+        let clone = info.clone();
+        assert_eq!(clone.name, "test");
+    }
+
+    #[test]
+    fn test_metal_buffer_placement_traits() {
+        let placement = MetalBufferPlacement::Unified;
+        assert!(format!("{:?}", placement).contains("Unified"));
+        
+        let placement2 = MetalBufferPlacement::Private;
+        assert_eq!(placement.clone(), MetalBufferPlacement::Unified);
+        assert_ne!(placement, placement2);
     }
 }

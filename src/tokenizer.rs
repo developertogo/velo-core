@@ -170,4 +170,82 @@ mod tests {
         assert_eq!(t.tokens.len(), 2);
         assert_eq!(t.encode("ab"), vec![0, 1]);
     }
+
+    #[test]
+    fn test_vocab_size() {
+        let t = mock_tokenizer();
+        assert_eq!(t.vocab_size(), 10);
+    }
+
+    #[test]
+    fn test_id_to_token_known() {
+        let t = mock_tokenizer();
+        assert_eq!(t.id_to_token(8), "the");
+        assert_eq!(t.id_to_token(0), "<unk>");
+    }
+
+    #[test]
+    fn test_id_to_token_out_of_range() {
+        let t = mock_tokenizer();
+        assert_eq!(t.id_to_token(9999), "<unk>");
+    }
+
+    #[test]
+    fn test_encode_fallback_skips_unknown_char() {
+        let t = mock_tokenizer();
+        // 'z' is not in the vocabulary — should be skipped
+        let ids = t.encode("z");
+        assert_eq!(ids, vec![] as Vec<u32>);
+    }
+
+    #[test]
+    fn test_decode_unknown_id_skipped() {
+        let t = mock_tokenizer();
+        // id 9999 is not in the vocab — decode should skip it silently
+        let ids = vec![8u32, 9999u32, 9u32];
+        assert_eq!(t.decode(&ids), "theq");
+    }
+
+    #[test]
+    fn test_encode_empty_string() {
+        let t = mock_tokenizer();
+        assert_eq!(t.encode(""), vec![] as Vec<u32>);
+    }
+
+    #[test]
+    fn test_decode_empty() {
+        let t = mock_tokenizer();
+        assert_eq!(t.decode(&[]), "");
+    }
+
+    #[test]
+    fn test_from_gguf_with_chat_template() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "tokenizer.chat_template".to_string(),
+            GgufValue::String("{{ messages[0].content }}".into()),
+        );
+        let file = GgufFile {
+            version: 3,
+            metadata,
+            tensors: std::collections::HashMap::new(),
+            data_offset: 0,
+        };
+        let t = Tokenizer::from_gguf(&file);
+        assert!(t.chat_template.is_some());
+        assert_eq!(t.vocab_size(), 0); // no tokens in this file
+    }
+
+    #[test]
+    fn test_from_gguf_empty_metadata() {
+        let file = GgufFile {
+            version: 3,
+            metadata: std::collections::HashMap::new(),
+            tensors: std::collections::HashMap::new(),
+            data_offset: 0,
+        };
+        let t = Tokenizer::from_gguf(&file);
+        assert_eq!(t.vocab_size(), 0);
+        assert!(t.chat_template.is_none());
+    }
 }

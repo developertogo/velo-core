@@ -89,3 +89,43 @@ impl ModelPool {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_pool_basic() {
+        let handles = MetalRuntimeHandles {
+            device: None,
+            command_queue: None,
+            library: None,
+        };
+        let pool = ModelPool::new(handles);
+        assert!(pool.get("test").is_none());
+        
+        pool.remove("test"); // Should not panic
+    }
+
+    #[test]
+    fn test_model_pool_errors() {
+        let handles = MetalRuntimeHandles {
+            device: None,
+            command_queue: None,
+            library: None,
+        };
+        let pool = ModelPool::new(handles);
+        let rx = pool.prefetch("test".into(), PathBuf::from("fake.gguf"));
+        
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let res = rx.await.unwrap();
+            assert!(res.is_err());
+            assert!(format!("{:?}", res.err().unwrap()).contains("No device"));
+        });
+        
+        let res_sync = pool.load_sync("test".into(), Path::new("fake.gguf"));
+        assert!(res_sync.is_err());
+        assert!(format!("{:?}", res_sync.err().unwrap()).contains("No device"));
+    }
+}

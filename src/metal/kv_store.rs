@@ -122,3 +122,70 @@ impl std::fmt::Debug for SharedMetalKvStore {
         write!(f, "SharedMetalKvStore")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_metal::MTLCreateSystemDefaultDevice;
+
+    #[test]
+    fn test_metal_kv_store_allocation() {
+        let device = match MTLCreateSystemDefaultDevice() {
+            Some(d) => d,
+            None => {
+                eprintln!("Skipping Metal test: No device available");
+                return;
+            }
+        };
+
+        let kv_bytes_per_token = 128;
+        let pool_pages = 10;
+        let page_tokens = 16;
+        let n_layer = 1;
+
+        let mut store = MetalKvStore::new(device, kv_bytes_per_token, pool_pages, page_tokens, n_layer);
+        
+        assert_eq!(store.allocated_bytes(), 0);
+
+        let handle1 = store.allocate(16).unwrap();
+        assert_eq!(handle1.block_id, 1);
+        assert_eq!(handle1.token_len, 16);
+
+        let block1 = store.get_block(handle1).unwrap();
+        assert_eq!(block1.handle, handle1);
+        assert_eq!(block1.bytes, 16 * 128);
+
+        let handle2 = store.allocate(16).unwrap();
+        assert_eq!(handle2.block_id, 2);
+
+        store.release_block(handle1).unwrap();
+        assert!(store.get_block(handle1).is_none());
+
+        // Allocate again, should reuse
+        let handle3 = store.allocate(16).unwrap();
+        assert_eq!(handle3.block_id, 3);
+        
+        // Exceed capacity
+        for _ in 0..8 {
+            store.allocate(16).unwrap();
+        }
+        assert!(store.allocate(16).is_err());
+    }
+
+    #[test]
+    fn test_shared_metal_kv_store() {
+        let device = match MTLCreateSystemDefaultDevice() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let store = MetalKvStore::new(device, 128, 5, 16, 1);
+        let mut shared = SharedMetalKvStore(Arc::new(Mutex::new(store)));
+
+        let handle = shared.allocate(16).unwrap();
+        assert!(shared.allocated_bytes() > 0);
+        
+        shared.release(handle).unwrap();
+        assert!(format!("{:?}", shared).contains("SharedMetalKvStore"));
+    }
+}

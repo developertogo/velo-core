@@ -26,6 +26,7 @@ impl Ord for TokenLogit {
 
 pub trait Sampler {
     fn sample(&self, logits: &[f32], mask: Option<&LogitMask>) -> NextTokenPrediction;
+    fn is_greedy(&self) -> bool { false }
 }
 
 pub struct GreedySampler;
@@ -50,6 +51,7 @@ impl Sampler for GreedySampler {
             confidence: max_logit,
         }
     }
+    fn is_greedy(&self) -> bool { true }
 }
 
 pub struct TopPSampler {
@@ -188,5 +190,78 @@ impl Sampler for MinPSampler {
             token: filtered_tokens[0].0,
             confidence: filtered_tokens[0].1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_greedy_sampler() {
+        let logits = vec![1.0, 5.0, 2.0, 4.0];
+        let sampler = GreedySampler;
+        let res = sampler.sample(&logits, None);
+        assert_eq!(res.token, 1);
+        assert_eq!(res.confidence, 5.0);
+        assert!(sampler.is_greedy());
+    }
+
+    #[test]
+    fn test_greedy_sampler_with_mask() {
+        let logits = vec![1.0, 5.0, 2.0, 4.0];
+        let mut mask = vob::vob![false; 4];
+        mask.set(0, true);
+        mask.set(2, true);
+        
+        let sampler = GreedySampler;
+        let res = sampler.sample(&logits, Some(&mask));
+        assert_eq!(res.token, 2);
+        assert_eq!(res.confidence, 2.0);
+    }
+
+    #[test]
+    fn test_top_p_sampler_greedy_fallback() {
+        let logits = vec![1.0, 5.0, 2.0, 4.0];
+        let sampler = TopPSampler { p: 1.0, temperature: 0.0 };
+        let res = sampler.sample(&logits, None);
+        assert_eq!(res.token, 1);
+    }
+
+    #[test]
+    fn test_top_p_sampler_basic() {
+        let logits = vec![1.0, 2.0, 3.0, 4.0];
+        let sampler = TopPSampler { p: 0.5, temperature: 1.0 };
+        let res = sampler.sample(&logits, None);
+        // With p=0.5, only tokens 3 and maybe 2 will be in the pool.
+        assert!(res.token == 3 || res.token == 2);
+    }
+
+    #[test]
+    fn test_min_p_sampler_basic() {
+        let logits = vec![1.0, 2.0, 3.0, 4.0];
+        let sampler = MinPSampler { min_p: 0.1, temperature: 1.0 };
+        let res = sampler.sample(&logits, None);
+        assert!(res.token <= 3);
+    }
+    
+    #[test]
+    fn test_samplers_empty_fallback() {
+        let logits = vec![1.0, 2.0];
+        let mask = vob::vob![false; 2];
+        
+        let top_p = TopPSampler { p: 0.9, temperature: 1.0 };
+        assert_eq!(top_p.sample(&logits, Some(&mask)).token, 1); // Falls back to greedy max
+
+        let min_p = MinPSampler { min_p: 0.1, temperature: 1.0 };
+        assert_eq!(min_p.sample(&logits, Some(&mask)).token, 1);
+    }
+
+    #[test]
+    fn test_token_logit_ord() {
+        let a = TokenLogit { token: 1, logit: 1.0 };
+        let b = TokenLogit { token: 2, logit: 2.0 };
+        assert!(b > a);
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Less);
     }
 }

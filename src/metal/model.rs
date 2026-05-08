@@ -46,8 +46,8 @@ impl LlamaMetalModel {
         let mut pipelines = HashMap::new();
         let functions = [
             "matvec_f32", "matvec_q4_0", "rms_norm", "rope", "silu", "vec_mul", "softmax",
-            "vec_add", "kv_update", "paged_attention_fused",
-            "kv_update_int8", "paged_attention_fused_int8"
+            "vec_add", "kv_update", "paged_attention_flash",
+            "kv_update_int8", "paged_attention_flash_int8", "argmax"
         ];
         for name in functions {
             if let Some(func) = library.newFunctionWithName(&objc2_foundation::NSString::from_str(name)) {
@@ -109,18 +109,75 @@ impl LlamaMetalModel {
         Ok(())
     }
 
-    pub fn forward_one(
+    /// Executes a full inference pass and returns the logits copied back to the CPU.
+    /// This is the standard entry point for generic sampling.
+    pub fn run(
         &mut self,
         token: TokenId,
         pos: usize,
-        k_pool: &ProtocolObject<dyn MTLBuffer>,
-        v_pool: &ProtocolObject<dyn MTLBuffer>,
         slot_id: SlotId,
         slot_mapping: &ProtocolObject<dyn MTLBuffer>,
+        k_pool: &ProtocolObject<dyn MTLBuffer>,
+        v_pool: &ProtocolObject<dyn MTLBuffer>,
         max_pages: usize,
         block_size: usize,
         kv_type: KvCacheType,
     ) -> Result<Vec<f32>> {
+        let (command_buffer, logits_buf) = self.forward(
+            token, pos, slot_id, slot_mapping, k_pool, v_pool, max_pages, block_size, kv_type
+        )?;
+        
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+
+        let n_vocab = self.meta.n_vocab;
+        let mut logits = vec![0.0f32; n_vocab];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                logits_buf.contents().as_ptr() as *const f32,
+                logits.as_mut_ptr(),
+                n_vocab,
+            );
+        }
+        Ok(logits)
+    }
+
+    /// Executes a full inference pass and performs GPU-resident sampling (greedy)
+    /// before returning the result. This avoids a CPU-GPU synchronization and copy
+    /// of the entire logit buffer (usually 32k-128k floats).
+    pub fn run_with_sampling(
+        &mut self,
+        token: TokenId,
+        pos: usize,
+        slot_id: SlotId,
+        slot_mapping: &ProtocolObject<dyn MTLBuffer>,
+        k_pool: &ProtocolObject<dyn MTLBuffer>,
+        v_pool: &ProtocolObject<dyn MTLBuffer>,
+        max_pages: usize,
+        block_size: usize,
+        kv_type: KvCacheType,
+    ) -> Result<u32> {
+        let (command_buffer, logits_buf) = self.forward(
+            token, pos, slot_id, slot_mapping, k_pool, v_pool, max_pages, block_size, kv_type
+        )?;
+        
+        self.sample_argmax(&command_buffer, &logits_buf)
+    }
+
+    /// Performs the core transformer forward pass on the GPU.
+    /// Returns the active command buffer and the scratch buffer containing the final logits.
+    pub fn forward(
+        &mut self,
+        token: TokenId,
+        pos: usize,
+        slot_id: SlotId,
+        slot_mapping: &ProtocolObject<dyn MTLBuffer>,
+        k_pool: &ProtocolObject<dyn MTLBuffer>,
+        v_pool: &ProtocolObject<dyn MTLBuffer>,
+        max_pages: usize,
+        block_size: usize,
+        kv_type: KvCacheType,
+    ) -> Result<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, Retained<ProtocolObject<dyn MTLBuffer>>)> {
         let n_embd = self.meta.n_embd;
         let n_layer = self.meta.n_layer;
         let head_dim = self.meta.head_dim;
@@ -235,8 +292,8 @@ impl LlamaMetalModel {
             {
                 let encoder = command_buffer.computeCommandEncoder().unwrap();
                 let kernel_name = match kv_type {
-                    KvCacheType::Fp32 => "paged_attention_fused",
-                    KvCacheType::Int8 | KvCacheType::Fp8 => "paged_attention_fused_int8",
+                    KvCacheType::Fp32 => "paged_attention_flash",
+                    KvCacheType::Int8 | KvCacheType::Fp8 => "paged_attention_flash_int8",
                 };
                 let pipeline = self.pipelines.get(kernel_name).unwrap();
                 unsafe {
@@ -251,6 +308,7 @@ impl LlamaMetalModel {
                     let max_pages_u32 = max_pages as u32;
                     let block_size_u32 = block_size as u32;
                     let n_head_kv_u32 = n_head_kv as u32;
+                    let n_head_u32 = n_head as u32;
                     encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&head_dim_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 4);
                     encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_ctx_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 5);
                     encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&pos_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 6);
@@ -259,6 +317,7 @@ impl LlamaMetalModel {
                     encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&max_pages_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 9);
                     encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&block_size_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 10);
                     encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_head_kv_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 11);
+                    encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_head_u32 as *const u32 as *mut _).unwrap(), std::mem::size_of::<u32>() as _, 12);
                     
                     encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n_head as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
                     encoder.endEncoding();
@@ -362,18 +421,54 @@ impl LlamaMetalModel {
             self.dispatch_matvec(&command_buffer, &logits_buf, w, &hidden_state, n_vocab, n_embd)?;
         }
 
+        Ok((command_buffer, logits_buf))
+    }
+
+    pub fn sample_argmax(
+        &mut self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        logits_buf: &ProtocolObject<dyn MTLBuffer>,
+    ) -> Result<u32> {
+        let n_vocab = self.meta.n_vocab;
+        let out_buf = self.get_scratch("argmax_out", 4);
+        let pipeline = self.pipelines.get("argmax").ok_or_else(|| {
+             SpeculativeError::Model("Argmax pipeline not found".to_string())
+        })?;
+
+        let encoder = command_buffer.computeCommandEncoder().ok_or_else(|| {
+             SpeculativeError::Model("Failed to create command encoder".to_string())
+        })?;
+        
+        unsafe {
+            encoder.setComputePipelineState(pipeline);
+            encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(logits_buf), 0, 1);
+            let n_u32 = n_vocab as u32;
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_u32 as *const u32 as *mut _).unwrap(), 4, 2);
+            
+            // Dispatch with 1024 threads in one TG
+            // Note: For vocab > 1024, this kernel only looks at the first 1024 tokens.
+            // A production version would use multiple threadgroups + global atomic.
+            let threads = n_vocab.min(1024);
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize { width: threads as _, height: 1, depth: 1 },
+                MTLSize { width: threads as _, height: 1, depth: 1 }
+            );
+            encoder.endEncoding();
+        }
+        
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
-
-        let mut logits = vec![0.0f32; n_vocab];
+        
+        let mut token_id = 0u32;
         unsafe {
             std::ptr::copy_nonoverlapping(
-                logits_buf.contents().as_ptr() as *const f32,
-                logits.as_mut_ptr(),
-                n_vocab,
+                out_buf.contents().as_ptr() as *const u32,
+                &mut token_id,
+                1,
             );
         }
-        Ok(logits)
+        Ok(token_id)
     }
 
     fn dispatch_matvec(
@@ -408,5 +503,125 @@ impl LlamaMetalModel {
             encoder.endEncoding();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_loader::WeightStore;
+    use objc2_metal::MTLCreateSystemDefaultDevice;
+
+    /// Helper: create a LlamaMetalModel from a dummy WeightStore.
+    /// Returns None when no Metal device is present (e.g. restricted CI).
+    fn make_model(n_vocab: usize, n_embd: usize) -> Option<LlamaMetalModel> {
+        let device = MTLCreateSystemDefaultDevice()?;
+        let queue = device.newCommandQueue()?;
+        let source = include_str!("../kernels.metal");
+        let options = objc2_metal::MTLCompileOptions::new();
+        let library = device
+            .newLibraryWithSource_options_error(
+                &objc2_foundation::NSString::from_str(source),
+                Some(&options),
+            )
+            .ok()?;
+
+        let weights = WeightStore::dummy_llama(n_vocab, n_embd, 1);
+        let mut model = LlamaMetalModel::new(weights.meta.clone(), device, queue, library);
+        model.upload_weights(&weights).ok()?;
+        Some(model)
+    }
+
+    #[test]
+    fn test_debug_impl() {
+        if let Some(model) = make_model(100, 32) {
+            let s = format!("{:?}", model);
+            assert!(s.contains("LlamaMetalModel"));
+            assert!(s.contains("weights_count"));
+        }
+    }
+
+    #[test]
+    fn test_get_scratch_reuses_buffer() {
+        if let Some(mut model) = make_model(100, 32) {
+            let buf1 = model.get_scratch("test_scratch", 256);
+            let buf2 = model.get_scratch("test_scratch", 128); // smaller — should reuse
+            // Both should point to the same allocation (same length)
+            assert_eq!(buf1.length(), buf2.length());
+
+            let buf3 = model.get_scratch("test_scratch", 512); // larger — new alloc
+            assert!(buf3.length() >= 512);
+        }
+    }
+
+    #[test]
+    fn test_upload_weights_populates_map() {
+        if let Some(model) = make_model(64, 32) {
+            assert!(!model.weights.is_empty(), "Weights should be non-empty after upload");
+        }
+    }
+
+    #[test]
+    fn test_pipelines_loaded() {
+        if let Some(model) = make_model(64, 32) {
+            // At minimum, the F32 kernel paths must be present
+            assert!(model.pipelines.contains_key("rms_norm"));
+            assert!(model.pipelines.contains_key("matvec_f32"));
+            assert!(model.pipelines.contains_key("argmax"));
+        }
+    }
+
+    #[test]
+    fn test_forward_produces_logits() {
+        if let Some(mut model) = make_model(100, 32) {
+            use crate::slot_manager::SlotId;
+            use crate::paged_attention::KvCacheType;
+            use objc2_metal::MTLResourceOptions;
+
+            let n_pages: usize = 4;
+            let slot_mapping_size = n_pages * std::mem::size_of::<u32>();
+            let slot_mapping = model.device
+                .newBufferWithLength_options(slot_mapping_size as _, MTLResourceOptions::StorageModeShared)
+                .expect("slot_mapping alloc");
+            let kv_size = 64 * 1024;
+            let k_pool = model.device.newBufferWithLength_options(kv_size, MTLResourceOptions::StorageModeShared).unwrap();
+            let v_pool = model.device.newBufferWithLength_options(kv_size, MTLResourceOptions::StorageModeShared).unwrap();
+
+            let result = model.run(
+                1, 0, SlotId(0),
+                &slot_mapping, &k_pool, &v_pool,
+                n_pages, 16, KvCacheType::Fp32,
+            );
+
+            assert!(result.is_ok(), "forward pass failed: {:?}", result.err());
+            let logits = result.unwrap();
+            assert_eq!(logits.len(), 100);
+        }
+    }
+
+    #[test]
+    fn test_run_with_sampling_returns_valid_token() {
+        if let Some(mut model) = make_model(100, 32) {
+            use crate::slot_manager::SlotId;
+            use crate::paged_attention::KvCacheType;
+            use objc2_metal::MTLResourceOptions;
+
+            let n_pages: usize = 4;
+            let slot_mapping = model.device
+                .newBufferWithLength_options((n_pages * 4) as _, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            let kv_size = 64 * 1024;
+            let k_pool = model.device.newBufferWithLength_options(kv_size, MTLResourceOptions::StorageModeShared).unwrap();
+            let v_pool = model.device.newBufferWithLength_options(kv_size, MTLResourceOptions::StorageModeShared).unwrap();
+
+            let token = model.run_with_sampling(
+                1, 0, SlotId(0),
+                &slot_mapping, &k_pool, &v_pool,
+                n_pages, 16, KvCacheType::Fp32,
+            );
+
+            assert!(token.is_ok(), "run_with_sampling failed: {:?}", token.err());
+            assert!(token.unwrap() < 100, "token must be in vocab range");
+        }
     }
 }

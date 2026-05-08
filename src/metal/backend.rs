@@ -156,18 +156,75 @@ impl CausalLmBackend for MetalBackend {
         }
 
         let pos = context.len() - 1;
-        let logits = model.forward_one(
+        let logits = model.run(
             last,
             pos,
-            store.k_pool(),
-            store.v_pool(),
             self.slot_id.ok_or_else(|| SpeculativeError::Model("Slot not bound".into()))?,
             self.slot_mapping.as_ref().ok_or_else(|| SpeculativeError::Model("Slot mapping not wired".into()))?,
+            store.k_pool(),
+            store.v_pool(),
             allocator.config().total_pages,
             self.config.paged_block_size,
             self.config.kv_type,
         )?;
         TokenLogits::new(logits)
+    }
+
+    fn sample_next(&mut self, context: &[TokenId], sampler: &dyn crate::sampling::Sampler) -> Result<crate::speculative::NextTokenPrediction> {
+        let Some(model_arc) = &self.model else {
+            return Err(Self::not_initialized());
+        };
+        let allocator_arc = self.allocator.as_ref().ok_or_else(|| SpeculativeError::Model("Allocator not wired".into()))?;
+        let store_arc = self.store.as_ref().ok_or_else(|| SpeculativeError::Model("Store not wired".into()))?;
+
+        let prefix = self.bound_prefix.as_ref().ok_or_else(|| SpeculativeError::Model("No prefix bound".to_string()))?;
+        let prefix_handle = prefix.handle.ok_or_else(|| {
+            SpeculativeError::Model("Prefix has no KV handle".to_string())
+        })?;
+
+        let mut model = model_arc.lock().unwrap();
+        let allocator = allocator_arc.0.lock().unwrap();
+        let store = store_arc.0.lock().unwrap();
+
+        let _span = allocator.materialize_span(prefix_handle).ok_or_else(|| {
+            SpeculativeError::Model(format!("Could not materialize span for prefix {:?}", prefix_handle))
+        })?;
+
+        let last = *context.last().ok_or_else(|| SpeculativeError::Model("Empty context".to_string()))?;
+        let pos = context.len() - 1;
+
+        // Optimized path for GreedySampler on GPU
+        if sampler.is_greedy() {
+            let token_id = model.run_with_sampling(
+                last,
+                pos,
+                self.slot_id.ok_or_else(|| SpeculativeError::Model("Slot not bound".into()))?,
+                self.slot_mapping.as_ref().ok_or_else(|| SpeculativeError::Model("Slot mapping not wired".into()))?,
+                store.k_pool(),
+                store.v_pool(),
+                allocator.config().total_pages,
+                self.config.paged_block_size,
+                self.config.kv_type,
+            )?;
+            return Ok(crate::speculative::NextTokenPrediction {
+                token: token_id as TokenId,
+                confidence: 1.0,
+            });
+        }
+
+        // Fallback to CPU sampling
+        let logits = model.run(
+            last,
+            pos,
+            self.slot_id.ok_or_else(|| SpeculativeError::Model("Slot not bound".into()))?,
+            self.slot_mapping.as_ref().ok_or_else(|| SpeculativeError::Model("Slot mapping not wired".into()))?,
+            store.k_pool(),
+            store.v_pool(),
+            allocator.config().total_pages,
+            self.config.paged_block_size,
+            self.config.kv_type,
+        )?;
+        Ok(sampler.sample(&logits, None))
     }
 
     fn verify_logits(
@@ -210,13 +267,13 @@ impl CausalLmBackend for MetalBackend {
         let max_pages = allocator.config().total_pages;
 
         for &tok in drafted {
-            let logits = model.forward_one(
+            let logits = model.run(
                 tok,
                 current_pos,
-                store.k_pool(),
-                store.v_pool(),
                 slot_id,
                 slot_mapping,
+                store.k_pool(),
+                store.v_pool(),
                 max_pages,
                 self.config.paged_block_size,
                 self.config.kv_type,
