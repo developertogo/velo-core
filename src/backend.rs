@@ -177,7 +177,13 @@ where
 
             for (batch_idx, &req_idx) in active_indices.iter().enumerate() {
                 let mask = requests[req_idx].2.as_mut().map(|m| m.next_mask());
-                let prediction = sampler.sample(batch_logits[batch_idx].values(), mask.as_ref());
+                let mask_ref = mask.as_ref();
+                let prediction = sampler.sample(batch_logits[batch_idx].values(), mask_ref);
+                if let Some(m) = mask_ref {
+                    if !m.get(prediction.token as usize).unwrap_or(false) {
+                        eprintln!("Sampler returned token {} which is NOT allowed by mask!", prediction.token);
+                    }
+                }
                 contexts[req_idx].push(prediction.token);
                 results[req_idx].push(prediction);
                 if let Some(m) = requests[req_idx].2.as_mut() {
@@ -244,7 +250,13 @@ where
             let mut steps = Vec::with_capacity(logits_vec.len());
             for logits in logits_vec {
                 let mask = requests[i].2.as_mut().map(|m| m.next_mask());
-                let prediction = sampler.sample(logits.values(), mask.as_ref());
+                let mask_ref = mask.as_ref();
+                let prediction = sampler.sample(logits.values(), mask_ref);
+                if let Some(m) = mask_ref {
+                    if !m.get(prediction.token as usize).unwrap_or(false) {
+                        eprintln!("TARGET Sampler returned token {} which is NOT allowed by mask!", prediction.token);
+                    }
+                }
                 steps.push(VerifyStep {
                     expected: prediction.token,
                 });

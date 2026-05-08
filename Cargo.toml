@@ -8,6 +8,7 @@ license = "MIT"
 [lib]
 name = "velo_core"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "velo-bench"
