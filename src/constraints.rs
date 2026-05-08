@@ -96,3 +96,20 @@ pub fn build_factory(tokenizer: &crate::tokenizer::Tokenizer) -> Result<Arc<Pars
     let factory = ParserFactory::new(&env, Default::default(), &[])?;
     Ok(Arc::new(factory))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constraint_enum() {
+        let regex = Constraint::Regex("a*".to_string());
+        assert!(format!("{:?}", regex).contains("Regex"));
+        
+        let json = Constraint::JsonSchema(serde_json::json!({"type": "string"}));
+        assert!(format!("{:?}", json).contains("JsonSchema"));
+        
+        let lark = Constraint::Lark("start: /a/".to_string());
+        assert!(format!("{:?}", lark).contains("Lark"));
+    }
+}

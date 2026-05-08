@@ -12,6 +12,54 @@ use super::config::MetalRuntimeConfig;
 use super::kv_store::SharedMetalKvStore;
 use super::types::{MetalBufferPlacement, MetalDeviceInfo};
 
+// ── AOT / JIT Library Loading ─────────────────────────────────────────────────
+
+/// Loads the Metal shader library, preferring an AOT pre-compiled `.metallib`
+/// over runtime JIT source compilation.
+///
+/// ## AOT Path (preferred)
+/// If `build.rs` successfully compiled `src/kernels.metal` into a `.metallib`
+/// at build time, its path is embedded via the `VELO_METALLIB_PATH` env var.
+/// We load it with `newLibraryWithURL_error` — zero shader compilation at
+/// startup, eliminating the 200–800 ms JIT penalty on cold inference.
+///
+/// ## JIT Fallback
+/// When the AOT artifact is absent (CI without Xcode, `VELO_SKIP_METALLIB=1`,
+/// cross-compilation), falls back to `newLibraryWithSource_options_error`.
+fn load_metal_library(
+    device: &ProtocolObject<dyn MTLDevice>,
+    kernel_source: &str,
+) -> std::result::Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
+    // ── AOT path: load via file URL ────────────────────────────────────────
+    if let Some(metallib_path) = option_env!("VELO_METALLIB_PATH") {
+        let url_str = format!("file://{}", metallib_path);
+        if let Some(url) = objc2_foundation::NSURL::URLWithString(
+            &objc2_foundation::NSString::from_str(&url_str),
+        ) {
+            match device.newLibraryWithURL_error(&url) {
+                Ok(lib) => {
+                    return Ok(lib);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[velo-core] Warning: AOT .metallib load failed ({:?}); falling back to JIT.",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // ── JIT fallback: compile MSL source at runtime ────────────────────────
+    device
+        .newLibraryWithSource_options_error(
+            &objc2_foundation::NSString::from_str(kernel_source),
+            None,
+        )
+        .map_err(|e| format!("JIT Metal compilation failed: {:?}", e))
+}
+
+
 /// Opaque handles to Metal framework objects.
 pub struct MetalRuntimeHandles {
     /// The Metal device (GPU).
@@ -114,12 +162,8 @@ impl MetalMemoryRuntime {
         })?;
 
         let kernel_source = include_str!("../kernels.metal");
-        let library = device.newLibraryWithSource_options_error(
-            &objc2_foundation::NSString::from_str(kernel_source),
-            None,
-        ).map_err(|e| {
-            SpeculativeError::Model(format!("Failed to compile Metal kernels: {:?}", e))
-        })?;
+        let library = load_metal_library(&device, kernel_source)
+            .map_err(|e| SpeculativeError::Model(format!("Failed to load Metal kernels: {}", e)))?;
 
         let context = MetalRuntimeContext {
             device: MetalDeviceInfo {
@@ -281,5 +325,35 @@ mod tests {
         cfg.model_name = "test".into();
         cfg.memory.paged_block_size = 0;
         assert!(MetalMemoryRuntime::new(cfg).is_err());
+    }
+
+    #[test]
+    fn test_runtime_handles_clone() {
+        let handles = MetalRuntimeHandles {
+            device: None,
+            command_queue: None,
+            library: None,
+        };
+        let handles2 = handles.clone();
+        assert!(handles2.device.is_none());
+    }
+
+    #[test]
+    fn test_metal_runtime_context_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MetalRuntimeContext>();
+        assert_send_sync::<MetalMemoryRuntime>();
+    }
+    
+    #[test]
+    fn test_shared_paged_attention_block_manager_debug() {
+        let mgr = SharedPagedAttentionBlockManager(Arc::new(Mutex::new(crate::paged_attention::PagedAttentionBlockManager::new(crate::paged_attention::PagedAttentionConfig {
+            total_pages: 10,
+            block_size: 16,
+            page_tokens: 16,
+            kv_type: crate::paged_attention::KvCacheType::Fp32,
+            unified_memory: true,
+        }))));
+        assert!(format!("{:?}", mgr).contains("SharedPagedAttentionBlockManager"));
     }
 }

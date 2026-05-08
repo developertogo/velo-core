@@ -31,6 +31,10 @@ name = "smoke_bench"
 path = "benches/smoke_bench.rs"
 harness = false
 
+[[bin]]
+name = "velo-project"
+path = "src/bin/velo-project.rs"
+
 [dependencies]
 objc2-metal = "0.3.2"
 objc2-foundation = "0.3.2"

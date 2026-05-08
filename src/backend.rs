@@ -24,6 +24,11 @@ pub trait CausalLmBackend {
 
     fn next_logits(&mut self, context: &[TokenId]) -> Result<TokenLogits>;
 
+    fn sample_next(&mut self, context: &[TokenId], sampler: &dyn Sampler) -> Result<NextTokenPrediction> {
+        let logits = self.next_logits(context)?;
+        Ok(sampler.sample(logits.values(), None))
+    }
+
     fn next_logits_batch(&mut self, contexts: &[&[TokenId]]) -> Result<Vec<TokenLogits>> {
         contexts
             .iter()

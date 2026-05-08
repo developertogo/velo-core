@@ -9,8 +9,9 @@ fn main() -> Result<()> {
     let prompt = (0..128).collect::<Vec<_>>();
     let script = (0..2048).collect::<Vec<_>>();
     let mut engine = VeloEngine::new(EngineConfig {
-        draft_window: 8,
-        memory: MemoryRuntimeConfig::cpu(4096, 16, 4096, 32, 32),
+        draft_window: 1,
+        memory: MemoryRuntimeConfig::cpu(16, 16, 32, 1, 32),
+        kv_type: velo_core::paged_attention::KvCacheType::Fp32,
     })
     .map_err(|error| velo_core::SpeculativeError::Model(error.to_string()))?;
 

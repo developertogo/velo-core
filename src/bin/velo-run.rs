@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use velo_core::{CausalLmBackend, GreedySampler, Sampler, TokenLogits};
+use velo_core::{CausalLmBackend, GreedySampler, Sampler};
 use velo_core::model_loader::load_gguf;
 use velo_core::llama_cpu::LlamaCpuModel;
 use velo_core::radix_cache::TokenId;
@@ -176,7 +176,7 @@ fn parse_args(args: &[String]) -> Result<RunConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use velo_core::TokenLogits;
 
     fn args(pairs: &[&str]) -> Vec<String> {
         let mut v = vec!["velo-run".to_string()];
