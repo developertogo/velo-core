@@ -11,6 +11,90 @@ pub struct VerifyStep {
     pub expected: TokenId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeVerifyResult {
+    pub expected: Vec<TokenId>, // Target model's expected token for each node in the tree
+}
+
+/// A tree of drafted tokens for parallel verification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeculativeTree {
+    pub nodes: Vec<TreeNode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeNode {
+    pub token: TokenId,
+    pub parent: Option<usize>, // Index of parent node in SpeculativeTree::nodes
+}
+
+impl SpeculativeTree {
+    pub fn new(token: TokenId) -> Self {
+        Self {
+            nodes: vec![TreeNode { token, parent: None }],
+        }
+    }
+
+    pub fn add_child(&mut self, parent_idx: usize, token: TokenId) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(TreeNode {
+            token,
+            parent: Some(parent_idx),
+        });
+        idx
+    }
+
+    /// Returns the sequence of tokens from the root to the given node.
+    pub fn get_path(&self, mut node_idx: usize) -> Vec<TokenId> {
+        let mut path = Vec::new();
+        loop {
+            let node = &self.nodes[node_idx];
+            path.push(node.token);
+            if let Some(parent) = node.parent {
+                node_idx = parent;
+            } else {
+                break;
+            }
+        }
+        path.reverse();
+        path
+    }
+
+    pub fn find_best_path(&self, verified: &TreeVerifyResult) -> (Vec<TokenId>, Option<TokenId>) {
+        let mut best_path = Vec::new();
+        let mut rejected_token = None;
+        let mut max_len = 0;
+
+        let mut valid = vec![false; self.nodes.len()];
+        valid[0] = true;
+
+        for i in 1..self.nodes.len() {
+            if let Some(parent) = self.nodes[i].parent {
+                if valid[parent] && self.nodes[i].token == verified.expected[parent] {
+                    valid[i] = true;
+                }
+            }
+        }
+
+        for i in 0..self.nodes.len() {
+            if valid[i] {
+                let path = self.get_path(i);
+                if path.len() >= max_len {
+                    max_len = path.len();
+                    best_path = path;
+                    rejected_token = if i < verified.expected.len() {
+                        Some(verified.expected[i])
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
+
+        (best_path, rejected_token)
+    }
+}
+
 pub trait DraftModel {
     fn bind_prefix_cache(&mut self, _prefix: &CacheLookup) -> Result<()> {
         Ok(())
@@ -30,6 +114,26 @@ pub trait DraftModel {
         max_tokens: usize,
         matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
     ) -> Result<Vec<NextTokenPrediction>>;
+
+    fn draft_tree(
+        &mut self,
+        context: &[TokenId],
+        _max_tokens: usize,
+        _width: usize,
+        _matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
+    ) -> Result<SpeculativeTree> {
+        // Default implementation: just a linear chain
+        let linear = self.draft(context, _max_tokens, _matcher)?;
+        if linear.is_empty() {
+            return Err(SpeculativeError::Model("Draft model returned no tokens".into()));
+        }
+        let mut tree = SpeculativeTree::new(linear[0].token);
+        let mut last_idx = 0;
+        for pred in linear.into_iter().skip(1) {
+            last_idx = tree.add_child(last_idx, pred.token);
+        }
+        Ok(tree)
+    }
 
     fn draft_batch(
         &mut self,
@@ -62,6 +166,33 @@ pub trait TargetModel {
         drafted: &[TokenId],
         matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
     ) -> Result<Vec<VerifyStep>>;
+
+    fn verify_tree(
+        &mut self,
+        context: &[TokenId],
+        tree: &SpeculativeTree,
+        _matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
+    ) -> Result<TreeVerifyResult> {
+        // Default implementation: verify the first path (leftmost branch)
+        let mut path_indices = Vec::new();
+        let mut curr = 0;
+        loop {
+            path_indices.push(curr);
+            if let Some(first_child) = tree.nodes.iter().position(|n| n.parent == Some(curr)) {
+                curr = first_child;
+            } else {
+                break;
+            }
+        }
+        let path: Vec<TokenId> = path_indices.iter().map(|&idx| tree.nodes[idx].token).collect();
+        let verified = self.verify(context, &path, _matcher)?;
+        
+        let mut expected = vec![0; tree.nodes.len()]; // 0 as placeholder
+        for (i, step) in path_indices.into_iter().zip(verified) {
+            expected[i] = step.expected;
+        }
+        Ok(TreeVerifyResult { expected })
+    }
 
     fn verify_batch(
         &mut self,
@@ -613,5 +744,36 @@ mod tests {
         let verified = vec![VerifyStep { expected: 4 }, VerifyStep { expected: 5 }]; // 5 != 9
         session.commit(&drafted, &verified).unwrap();
         assert_eq!(session.current_window(), 2); // accepted=1 + 1 = 2
+    }
+
+    #[test]
+    fn test_tree_best_path() {
+        // Create a tree:
+        //   root (0: token 10)
+        //    /   \
+        // child1(1: token 20)  child2(2: token 30)
+        //  |
+        // grandchild1(3: token 40)
+        
+        let mut tree = SpeculativeTree::new(10);
+        let c1 = tree.add_child(0, 20);
+        let _c2 = tree.add_child(0, 30);
+        let _gc1 = tree.add_child(c1, 40);
+
+        // Scenario 1: c2 is the only correct path
+        let verified = TreeVerifyResult {
+            expected: vec![30, 99, 99, 99], // After root (0), the target model says 30.
+        };
+        let (best_path, rejected) = tree.find_best_path(&verified);
+        assert_eq!(best_path, vec![10, 30]);
+        assert_eq!(rejected, Some(99)); // After 30 (node 2), target model says 99.
+        
+        // Scenario 2: c1 path is better
+        let verified = TreeVerifyResult {
+            expected: vec![20, 40, 99, 99], // root -> 20, 20 -> 40, 40 -> 99
+        };
+        let (best_path, rejected) = tree.find_best_path(&verified);
+        assert_eq!(best_path, vec![10, 20, 40]);
+        assert_eq!(rejected, Some(99));
     }
 }

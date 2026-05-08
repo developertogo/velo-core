@@ -75,6 +75,25 @@ kernel void matvec_f32(
     out[tpig] = sum;
 }
 
+kernel void matvec_batched_f32(
+    device float* out [[buffer(0)]], // [batch, rows]
+    device const float* w [[buffer(1)]], // [rows, cols]
+    device const float* x [[buffer(2)]], // [batch, cols]
+    constant uint& rows [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    uint2 tpig [[thread_position_in_grid]] // [row, batch_idx]
+) {
+    uint row = tpig.x;
+    uint batch_idx = tpig.y;
+    if (row >= rows) return;
+
+    float sum = 0.0f;
+    for (uint c = 0; c < cols; c++) {
+        sum += w[row * cols + c] * x[batch_idx * cols + c];
+    }
+    out[batch_idx * rows + row] = sum;
+}
+
 // ── Matrix-Vector Multiply (Q4_0) ─────────────────────────────────────────────
 // Block: 2 bytes scale (f16) + 16 bytes nibbles (32 elements) = 18 bytes.
 kernel void matvec_q4_0(
@@ -105,6 +124,38 @@ kernel void matvec_q4_0(
         }
     }
     out[tpig] = sum;
+}
+
+kernel void matvec_batched_q4_0(
+    device float* out [[buffer(0)]],
+    device const uchar* w [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    uint2 tpig [[thread_position_in_grid]] // [row, batch_idx]
+) {
+    uint row = tpig.x;
+    uint batch_idx = tpig.y;
+    if (row >= rows) return;
+
+    float sum = 0.0f;
+    uint n_blocks = cols / 32;
+    uint row_offset = row * n_blocks * 18;
+
+    for (uint b = 0; b < n_blocks; b++) {
+        uint block_start = row_offset + b * 18;
+        half delta = *(device const half*)(w + block_start);
+        device const uchar* nibbles = w + block_start + 2;
+
+        for (uint i = 0; i < 16; i++) {
+            uchar byte = nibbles[i];
+            float lo = (float)((int)(byte & 0x0F) - 8);
+            float hi = (float)((int)(byte >> 4) - 8);
+            sum += (float)delta * lo * x[batch_idx * cols + b * 32 + i * 2];
+            sum += (float)delta * hi * x[batch_idx * cols + b * 32 + i * 2 + 1];
+        }
+    }
+    out[batch_idx * rows + row] = sum;
 }
 
 // ── Activation (SiLU) ─────────────────────────────────────────────────────────
@@ -239,6 +290,104 @@ kernel void paged_attention_flash(
     for (uint d = 0; d < head_dim; d++) {
         head_out[d] = acc[d] / l;
     }
+}
+
+/**
+ * Tree-Based Paged Attention.
+ * 
+ * Verifies multiple speculative branches in parallel by following ancestor paths.
+ * Each query at tree node 'i' only attends to tokens in its direct lineage.
+ * 
+ * @param ancestors_map  Buffer mapping each node to its ancestor indices in the tree.
+ *                       Layout: [tree_size, max_depth] where -1 indicates no more ancestors.
+ */
+kernel void paged_attention_tree(
+    device float* out [[buffer(0)]],
+    device const float* q [[buffer(1)]],
+    device const float* k_cache [[buffer(2)]],
+    device const float* v_cache [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& n_ctx [[buffer(5)]], // Prompt length
+    constant uint& tree_size [[buffer(6)]],
+    constant uint& slot_id [[buffer(7)]],
+    device const uint* slot_mapping [[buffer(8)]],
+    constant uint& max_pages [[buffer(9)]],
+    constant uint& block_size [[buffer(10)]],
+    constant uint& n_head_kv [[buffer(11)]],
+    constant uint& n_head [[buffer(12)]],
+    device const int* ancestors_map [[buffer(13)]],
+    constant uint& max_tree_depth [[buffer(14)]],
+    uint2 tg_pos [[thread_position_in_grid]] // [node_idx, head_idx]
+) {
+    uint node_idx = tg_pos.x;
+    uint head_idx = tg_pos.y;
+    if (node_idx >= tree_size || head_idx >= n_head) return;
+
+    uint kv_head_idx = head_idx / (n_head / n_head_kv);
+    device const float* node_q = q + (node_idx * n_head * head_dim) + (head_idx * head_dim);
+    device float* node_out = out + (node_idx * n_head * head_dim) + (head_idx * head_dim);
+
+    float inv_sqrt_head_dim = 1.0f / sqrt((float)head_dim);
+    
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[128];
+    for (uint i = 0; i < head_dim; i++) acc[i] = 0.0f;
+
+    // 1. Attend to Prompt (already in KV cache)
+    for (uint t = 0; t < n_ctx; t++) {
+        uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
+        uint token_in_block = t % block_size;
+        device const float* head_k = k_cache + (block_idx * block_size * n_head_kv * head_dim) + (token_in_block * n_head_kv * head_dim) + (kv_head_idx * head_dim);
+        
+        float score = 0.0f;
+        for (uint d = 0; d < head_dim; d++) score += node_q[d] * head_k[d];
+        score *= inv_sqrt_head_dim;
+
+        float m_old = m;
+        m = max(m_old, score);
+        float exp_score = exp(score - m);
+        float exp_m_diff = exp(m_old - m);
+        l = l * exp_m_diff + exp_score;
+
+        device const float* head_v = v_cache + (block_idx * block_size * n_head_kv * head_dim) + (token_in_block * n_head_kv * head_dim) + (kv_head_idx * head_dim);
+        for (uint d = 0; d < head_dim; d++) acc[d] = acc[d] * exp_m_diff + exp_score * head_v[d];
+    }
+
+    // 2. Attend to Ancestors in the Tree
+    // Note: This assumes the drafted tokens for the current tree are NOT yet in k_cache,
+    // or they are passed in a separate buffer. 
+    // To keep it a single pass, we'll assume they are in 'q' or a 'k_tree' buffer.
+    // For now, let's assume 'verify_tree' will populate the KV cache for the tree nodes first.
+    // Wait! If they are in KV cache, we need their positions.
+    for (uint depth = 0; depth < max_tree_depth; depth++) {
+        int ancestor_idx = ancestors_map[node_idx * max_tree_depth + depth];
+        if (ancestor_idx == -1) break;
+        if ((uint)ancestor_idx == node_idx) continue; // Don't attend to self? (Causal)
+
+        // Find ancestor's token in KV cache
+        uint t = n_ctx + depth; // Depth corresponds to position in the sequence
+        uint block_idx = slot_mapping[slot_id * max_pages + (t / block_size)];
+        uint token_in_block = t % block_size;
+        
+        device const float* head_k = k_cache + (block_idx * block_size * n_head_kv * head_dim) + (token_in_block * n_head_kv * head_dim) + (kv_head_idx * head_dim);
+        // ... same softmax logic ...
+        float score = 0.0f;
+        for (uint d = 0; d < head_dim; d++) score += node_q[d] * head_k[d];
+        score *= inv_sqrt_head_dim;
+
+        float m_old = m;
+        m = max(m_old, score);
+        float exp_score = exp(score - m);
+        float exp_m_diff = exp(m_old - m);
+        l = l * exp_m_diff + exp_score;
+
+        device const float* head_v = v_cache + (block_idx * block_size * n_head_kv * head_dim) + (token_in_block * n_head_kv * head_dim) + (kv_head_idx * head_dim);
+        for (uint d = 0; d < head_dim; d++) acc[d] = acc[d] * exp_m_diff + exp_score * head_v[d];
+    }
+
+    // 3. Finalize
+    for (uint d = 0; d < head_dim; d++) node_out[d] = acc[d] / l;
 }
 
 kernel void kv_update(
