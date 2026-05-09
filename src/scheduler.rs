@@ -76,7 +76,7 @@ impl VeloScheduler {
             // Initialize model pool with hardware handles from the engine
             let pool = crate::model_pool::ModelPool::new(
                 engine.runtime().metal_handles().unwrap_or(MetalRuntimeHandles {
-                    device: None, command_queue: None, library: None
+                    device: None, command_queue: None, library: None, tp_degree: 1, tp_rank: 0
                 })
             );
 

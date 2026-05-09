@@ -12,6 +12,8 @@ fn test_config() -> MetalRuntimeConfig {
     config.memory.bytes_per_token = 128;
     config.memory.paged_block_size = 16;
     config.memory.paged_total_pages = 100;
+    config.memory.max_slots = 1;
+    config.memory.n_layer = 1;
     config
 }
 

@@ -716,8 +716,9 @@ mod tests {
     fn can_generate_over_placeholder_metal_runtime() {
         let Ok(runtime) = MetalMemoryRuntime::new(MetalRuntimeConfig {
             model_name: "draft-1b".to_string(),
-            memory: MemoryRuntimeConfig::cpu(32, 8, 16, 32, 32),
+            memory: MemoryRuntimeConfig::new(32, 8, 16, 32, 32),
             quantization: Quantization::Q4K,
+            tensor_parallel_degree: 1,
         }) else {
             // Skip if Metal device not found in test environment
             return;

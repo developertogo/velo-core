@@ -4,6 +4,8 @@ pub mod kv_store;
 pub mod runtime;
 pub mod model;
 pub mod backend;
+pub mod sharding;
+pub mod tp_model;
 
 pub use types::*;
 pub use config::*;
@@ -11,6 +13,8 @@ pub use kv_store::*;
 pub use runtime::*;
 pub use model::*;
 pub use backend::*;
+pub use sharding::*;
+pub use tp_model::*;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -70,6 +74,7 @@ mod tests {
             model_name: "test".to_string(),
             memory: MemoryRuntimeConfig::cpu(4096, 16, 32, 32, 32),
             quantization: Quantization::F32,
+            tensor_parallel_degree: 1,
         };
 
         let mut cfg = base_cfg.clone();

@@ -46,6 +46,7 @@ fn test_llama3_8b_parity() {
         model_name: "test".to_string(),
         memory: MemoryRuntimeConfig::cpu(kv_bytes_per_token, 16, 256, n_layer, 32),
         quantization: weights.meta.quantization,
+        tensor_parallel_degree: 1,
     }).unwrap();
 
     let slot_mapping = device.newBufferWithLength_options(

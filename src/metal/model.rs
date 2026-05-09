@@ -51,7 +51,7 @@ impl LlamaMetalModel {
             "vec_add", "kv_update", "paged_attention_flash",
             "kv_update_int8", "paged_attention_flash_int8", "argmax",
             "matvec_batched_f32", "matvec_batched_q4_0", "paged_attention_tree",
-            "matvec_lora_batched"
+            "matvec_lora_batched", "embed_lookup"
         ];
         for name in functions {
             if let Some(func) = library.newFunctionWithName(&objc2_foundation::NSString::from_str(name)) {
@@ -186,6 +186,132 @@ impl LlamaMetalModel {
     /// 3. Final layer normalization and output projection.
     /// 
     /// Returns the active `MTLCommandBuffer` (not yet committed) and the logits buffer.
+    /// Executes a single layer of the transformer.
+    /// Returns the attention output and MLP output buffers (partially computed if TP is used).
+    pub fn forward_layer(
+        &mut self,
+        l: usize,
+        hidden_state: &ProtocolObject<dyn MTLBuffer>,
+        pos: usize,
+        slot_id: crate::slot_manager::SlotId,
+        slot_mapping: &ProtocolObject<dyn MTLBuffer>,
+        k_pool: &ProtocolObject<dyn MTLBuffer>,
+        v_pool: &ProtocolObject<dyn MTLBuffer>,
+        max_pages: usize,
+        block_size: usize,
+        kv_type: KvCacheType,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<(Retained<ProtocolObject<dyn MTLBuffer>>, Retained<ProtocolObject<dyn MTLBuffer>>)> {
+        let n_embd = self.meta.n_embd;
+        let n_head = self.meta.n_head;
+        let n_head_kv = self.meta.n_head_kv;
+        let head_dim = self.meta.head_dim;
+
+        // 1. Attention Norm
+        let attn_in = self.get_scratch(&format!("l{}.attn_norm", l), n_embd * 4);
+        let norm_w = self.weights.get(&format!("layers.{}.attention_norm.weight", l))
+            .ok_or_else(|| SpeculativeError::Model(format!("Missing attention_norm.weight for layer {}", l)))?;
+        
+        self.dispatch_rms_norm(command_buffer, &attn_in, hidden_state, norm_w, n_embd)?;
+
+        // 2. QKV Projections (Column-parallel)
+        let q_buf = self.get_scratch(&format!("l{}.q", l), n_head * head_dim * 4);
+        let k_buf = self.get_scratch(&format!("l{}.k", l), n_head_kv * head_dim * 4);
+        let v_buf = self.get_scratch(&format!("l{}.v", l), n_head_kv * head_dim * 4);
+
+        for (name, buf, rows) in [
+            ("wq", &q_buf, n_head * head_dim),
+            ("wk", &k_buf, n_head_kv * head_dim),
+            ("wv", &v_buf, n_head_kv * head_dim),
+        ] {
+            let w = self.weights.get(&format!("layers.{}.attention.{}.weight", l, name))
+                .ok_or_else(|| SpeculativeError::Model(format!("Missing {}.weight", name)))?;
+            self.dispatch_matvec(command_buffer, buf, w, &attn_in, rows, n_embd)?;
+        }
+
+        // 3. Paged Attention
+        let attn_out = self.get_scratch(&format!("l{}.attn_out", l), n_head * head_dim * 4);
+        self.dispatch_paged_attention(
+            command_buffer,
+            &attn_out,
+            &q_buf,
+            k_pool,
+            v_pool,
+            slot_mapping,
+            slot_id,
+            pos,
+            max_pages,
+            block_size,
+            kv_type,
+        )?;
+
+        // 4. Output Projection (Row-parallel)
+        let attn_out_proj = self.get_scratch(&format!("l{}.attn_out_proj", l), n_embd * 4);
+        let wo = self.weights.get(&format!("layers.{}.attention.wo.weight", l))
+            .ok_or_else(|| SpeculativeError::Model(format!("Missing wo.weight for layer {}", l)))?;
+        self.dispatch_matvec(command_buffer, &attn_out_proj, wo, &attn_out, n_embd, n_head * head_dim)?;
+
+        // 5. MLP Norm
+        let mlp_in = self.get_scratch(&format!("l{}.ffn_norm", l), n_embd * 4);
+        let ffn_norm_w = self.weights.get(&format!("layers.{}.ffn_norm.weight", l))
+            .ok_or_else(|| SpeculativeError::Model(format!("Missing ffn_norm.weight for layer {}", l)))?;
+        self.dispatch_rms_norm(command_buffer, &mlp_in, hidden_state, ffn_norm_w, n_embd)?;
+
+        // 6. MLP Projections (Column-parallel)
+        let n_ff = self.meta.n_ff;
+        let gate_buf = self.get_scratch(&format!("l{}.gate", l), n_ff * 4);
+        let up_buf = self.get_scratch(&format!("l{}.up", l), n_ff * 4);
+
+        let w1 = self.weights.get(&format!("layers.{}.feed_forward.w1.weight", l)).unwrap();
+        let w3 = self.weights.get(&format!("layers.{}.feed_forward.w3.weight", l)).unwrap();
+        
+        self.dispatch_matvec(command_buffer, &gate_buf, w1, &mlp_in, n_ff, n_embd)?;
+        self.dispatch_matvec(command_buffer, &up_buf, w3, &mlp_in, n_ff, n_embd)?;
+
+        // 7. SiLU & Mul
+        self.dispatch_silu_mul(command_buffer, &gate_buf, &up_buf, n_ff)?;
+
+        // 8. MLP Down-projection (Row-parallel)
+        let mlp_out = self.get_scratch(&format!("l{}.mlp_out", l), n_embd * 4);
+        let w2 = self.weights.get(&format!("layers.{}.feed_forward.w2.weight", l)).unwrap();
+        self.dispatch_matvec(command_buffer, &mlp_out, w2, &gate_buf, n_embd, n_ff)?;
+
+        Ok((attn_out_proj, mlp_out))
+    }
+
+    pub fn dispatch_rms_norm(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>, out: &ProtocolObject<dyn MTLBuffer>, input: &ProtocolObject<dyn MTLBuffer>, weights: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Result<()> {
+        let encoder = cb.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(self.pipelines.get("rms_norm").unwrap());
+        let eps = self.meta.norm_eps;
+        let n_u32 = n as u32;
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(out), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(weights), 0, 2);
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&eps as *const f32 as *mut _).unwrap(), 4, 3);
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_u32 as *const u32 as *mut _).unwrap(), 4, 4);
+            encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
+        }
+        encoder.endEncoding();
+        Ok(())
+    }
+
+    pub fn dispatch_silu_mul(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>, gate: &ProtocolObject<dyn MTLBuffer>, up: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Result<()> {
+        let encoder = cb.computeCommandEncoder().unwrap();
+        unsafe {
+            encoder.setComputePipelineState(self.pipelines.get("silu").unwrap());
+            encoder.setBuffer_offset_atIndex(Some(gate), 0, 0);
+            encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
+
+            encoder.setComputePipelineState(self.pipelines.get("vec_mul").unwrap());
+            encoder.setBuffer_offset_atIndex(Some(gate), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(up), 0, 1);
+            encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
+        }
+        encoder.endEncoding();
+        Ok(())
+    }
+
     pub fn forward(
         &mut self,
         token: TokenId,
@@ -651,7 +777,59 @@ impl LlamaMetalModel {
         Ok(token_id)
     }
 
-    fn dispatch_matvec(
+    pub fn dispatch_paged_attention(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        out: &ProtocolObject<dyn MTLBuffer>,
+        q: &ProtocolObject<dyn MTLBuffer>,
+        k_pool: &ProtocolObject<dyn MTLBuffer>,
+        v_pool: &ProtocolObject<dyn MTLBuffer>,
+        slot_mapping: &ProtocolObject<dyn MTLBuffer>,
+        slot_id: SlotId,
+        pos: usize,
+        max_pages: usize,
+        block_size: usize,
+        kv_type: KvCacheType,
+    ) -> Result<()> {
+        let n_head = self.meta.n_head;
+        let n_head_kv = self.meta.n_head_kv;
+        let head_dim = self.meta.head_dim;
+        
+        let encoder = command_buffer.computeCommandEncoder().unwrap();
+        let kernel_name = match kv_type {
+            KvCacheType::Fp32 => "paged_attention_flash",
+            KvCacheType::Int8 | KvCacheType::Fp8 => "paged_attention_flash_int8",
+        };
+        let pipeline = self.pipelines.get(kernel_name).unwrap();
+        unsafe {
+            encoder.setComputePipelineState(pipeline);
+            encoder.setBuffer_offset_atIndex(Some(out), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(q), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(k_pool), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(v_pool), 0, 3);
+            let head_dim_u32 = head_dim as u32;
+            let n_ctx_u32 = (pos + 1) as u32;
+            let pos_u32 = pos as u32;
+            let max_pages_u32 = max_pages as u32;
+            let block_size_u32 = block_size as u32;
+            let n_head_kv_u32 = n_head_kv as u32;
+            let n_head_u32 = n_head as u32;
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&head_dim_u32 as *const u32 as *mut _).unwrap(), 4, 4);
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_ctx_u32 as *const u32 as *mut _).unwrap(), 4, 5);
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&pos_u32 as *const u32 as *mut _).unwrap(), 4, 6);
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&slot_id as *const SlotId as *mut _).unwrap(), 4, 7);
+            encoder.setBuffer_offset_atIndex(Some(slot_mapping), 0, 8);
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&max_pages_u32 as *const u32 as *mut _).unwrap(), 4, 9);
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&block_size_u32 as *const u32 as *mut _).unwrap(), 4, 10);
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_head_kv_u32 as *const u32 as *mut _).unwrap(), 4, 11);
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::new(&n_head_u32 as *const u32 as *mut _).unwrap(), 4, 12);
+            encoder.dispatchThreads_threadsPerThreadgroup(MTLSize { width: n_head as _, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
+            encoder.endEncoding();
+        }
+        Ok(())
+    }
+
+    pub fn dispatch_matvec(
         &self,
         command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         out: &ProtocolObject<dyn MTLBuffer>,

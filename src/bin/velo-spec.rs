@@ -64,6 +64,7 @@ fn run(args: &[String]) -> Result<(), String> {
         model_name: "target".to_string(),
         memory: MemoryRuntimeConfig::cpu(kv_bytes_per_token, 16, 256, target_meta.n_layer, 32).with_kv_type(velo_core::paged_attention::KvCacheType::Fp32),
         quantization: target_meta.quantization,
+        tensor_parallel_degree: 1,
     }).map_err(|e| format!("Failed to create runtime: {e}"))?;
 
     let mut target_backend = MetalBackend::new(MetalBackendConfig {
@@ -73,6 +74,7 @@ fn run(args: &[String]) -> Result<(), String> {
         paged_block_size: 16,
         quantization: target_meta.quantization,
         kv_type: velo_core::paged_attention::KvCacheType::Fp32,
+        tensor_parallel_degree: 1,
         }).map_err(|e| format!("Failed to create target backend: {e}"))?;
     target_backend.wire(target_weights, &target_runtime).map_err(|e| format!("Failed to wire target: {e}"))?;
 
@@ -83,6 +85,7 @@ fn run(args: &[String]) -> Result<(), String> {
         paged_block_size: 16,
         quantization: draft_weights.meta.quantization,
         kv_type: velo_core::paged_attention::KvCacheType::Fp32,
+        tensor_parallel_degree: 1,
         }).map_err(|e| format!("Failed to create draft backend: {e}"))?;
    
     // For simplicity, we reuse the target runtime's context if they are both unified
