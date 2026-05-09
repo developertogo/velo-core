@@ -253,10 +253,23 @@ impl NodeRegistry {
     }
 
     /// Select the least-loaded peer that can accept `needed_tokens`.
-    pub fn best_peer(&self, exclude: NixlNodeId, needed_tokens: usize) -> Option<PeerStatus> {
+    /// If `targets` is provided, only consider nodes in that list.
+    pub fn best_peer(
+        &self,
+        exclude: NixlNodeId,
+        needed_tokens: usize,
+        targets: Option<&[NixlNodeId]>,
+    ) -> Option<PeerStatus> {
         self.peers_except(exclude)
             .into_iter()
             .filter(|p| p.free_tokens >= needed_tokens)
+            .filter(|p| {
+                if let Some(targets) = targets {
+                    targets.contains(&p.node_id)
+                } else {
+                    true
+                }
+            })
             .min_by(|a, b| a.utilisation.partial_cmp(&b.utilisation).unwrap())
     }
 
@@ -356,6 +369,7 @@ impl CacheTransferAgent {
         &mut self,
         handles: &[KvCacheHandle],
         payloads: &[Vec<u8>],
+        targets: Option<&[NixlNodeId]>,
     ) -> Vec<TransferOutcome> {
         let empty: Vec<u8> = vec![];
         let mut outcomes = Vec::with_capacity(handles.len());
@@ -364,7 +378,7 @@ impl CacheTransferAgent {
             let payload = payloads.get(i).unwrap_or(&empty);
             let needed = handle.token_len;
 
-            let Some(peer) = self.registry.best_peer(self.node_id, needed) else {
+            let Some(peer) = self.registry.best_peer(self.node_id, needed, targets) else {
                 self.stats.blocks_dropped += 1;
                 outcomes.push(TransferOutcome::DroppedLocally);
                 continue;
@@ -577,8 +591,23 @@ mod tests {
         registry.heartbeat(b, 0.8, 200);
         registry.heartbeat(c, 0.2, 800);
 
-        let best = registry.best_peer(a, 100).unwrap();
+        let best = registry.best_peer(a, 100, None).unwrap();
         assert_eq!(best.node_id, c);
+    }
+
+    #[test]
+    fn registry_selects_within_target_list() {
+        let registry = NodeRegistry::new();
+        let a = registry.register(1000);
+        let b = registry.register(1000);
+        let c = registry.register(1000);
+
+        // c is less loaded than b, but we only target b.
+        registry.heartbeat(b, 0.5, 500);
+        registry.heartbeat(c, 0.2, 800);
+
+        let best = registry.best_peer(a, 100, Some(&[b])).unwrap();
+        assert_eq!(best.node_id, b);
     }
 
     #[test]
@@ -588,7 +617,7 @@ mod tests {
         let b = registry.register(10);
         registry.heartbeat(b, 1.0, 0);
 
-        assert!(registry.best_peer(a, 100).is_none());
+        assert!(registry.best_peer(a, 100, None).is_none());
     }
 
     // --- CacheTransferAgent ---
@@ -602,7 +631,7 @@ mod tests {
         let handles = vec![dummy_handle(1, 8), dummy_handle(2, 4)];
         let payloads = vec![vec![0xAAu8; 64], vec![0xBBu8; 32]];
 
-        let outcomes = sender.handoff(&handles, &payloads);
+        let outcomes = sender.handoff(&handles, &payloads, None);
         assert_eq!(outcomes.len(), 2);
         for outcome in &outcomes {
             assert!(matches!(outcome, TransferOutcome::Sent { .. }));
@@ -615,7 +644,7 @@ mod tests {
     fn handoff_drops_when_no_peer_available() {
         let (_, mut agents) = build_fabric(1, 256, 2, 1000);
         let handles = vec![dummy_handle(99, 5)];
-        let outcomes = agents[0].handoff(&handles, &[]);
+        let outcomes = agents[0].handoff(&handles, &[], None);
 
         assert_eq!(outcomes, vec![TransferOutcome::DroppedLocally]);
         assert_eq!(agents[0].stats.blocks_dropped, 1);
@@ -628,7 +657,7 @@ mod tests {
         // Agent 0 ships a block to Agent 1's inbox.
         let handles = vec![dummy_handle(7, 4)];
         let payloads = vec![vec![0xCCu8; 32]];
-        agents[0].handoff(&handles, &payloads);
+        agents[0].handoff(&handles, &payloads, None);
 
         let received = agents[1].drain_inbox();
         assert_eq!(received.len(), 1);
@@ -643,7 +672,7 @@ mod tests {
     fn handoff_without_payloads_uses_zero_bytes() {
         let (_, mut agents) = build_fabric(2, 64, 2, 5000);
         let handles = vec![dummy_handle(3, 2)];
-        let outcomes = agents[0].handoff(&handles, &[]); // no payload slice
+        let outcomes = agents[0].handoff(&handles, &[], None); // no payload slice
         assert!(matches!(outcomes[0], TransferOutcome::Sent { .. }));
     }
 
@@ -655,7 +684,7 @@ mod tests {
             dummy_handle(11, 4),
             dummy_handle(12, 4),
         ];
-        agents[0].handoff(&handles, &[]);
+        agents[0].handoff(&handles, &[], None);
         assert_eq!(agents[0].dma_stats().blocks_serialized, 3);
     }
 
@@ -669,7 +698,7 @@ mod tests {
     fn remote_block_carries_origin_and_payload() {
         let (_, mut agents) = build_fabric(3, 256, 4, 10_000);
         let payload = vec![0xDEu8; 100];
-        agents[0].handoff(&[dummy_handle(1, 8)], &[payload.clone()]);
+        agents[0].handoff(&[dummy_handle(1, 8)], &[payload.clone()], None);
 
         // Drain either agent 1 or agent 2 — one should have it.
         let mut received = agents[1].drain_inbox();
