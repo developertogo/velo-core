@@ -17,6 +17,8 @@ pub struct MetalBackendConfig {
     pub quantization: Quantization,
     /// Type of KV cache quantization.
     pub kv_type: KvCacheType,
+    /// Number of GPUs to shard the model across (Tensor Parallelism degree).
+    pub tensor_parallel_degree: usize,
 }
 
 impl Default for MetalBackendConfig {
@@ -28,6 +30,7 @@ impl Default for MetalBackendConfig {
             paged_block_size: 16,
             quantization: Quantization::Q4_0,
             kv_type: KvCacheType::Fp32,
+            tensor_parallel_degree: 1,
         }
     }
 }
@@ -41,6 +44,8 @@ pub struct MetalRuntimeConfig {
     pub memory: MemoryRuntimeConfig,
     /// Quantization format.
     pub quantization: Quantization,
+    /// Tensor Parallelism degree.
+    pub tensor_parallel_degree: usize,
 }
 
 impl Default for MetalRuntimeConfig {
@@ -49,6 +54,7 @@ impl Default for MetalRuntimeConfig {
             model_name: "llama-metal".to_string(),
             memory: MemoryRuntimeConfig::default(),
             quantization: Quantization::Q4_0,
+            tensor_parallel_degree: 1,
         }
     }
 }

@@ -1,6 +1,19 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// ── Embedding Lookup ──────────────────────────────────────────────────────────
+
+kernel void embed_lookup(
+    device float* out [[buffer(0)]],
+    device const float* w [[buffer(1)]],
+    constant uint& token [[buffer(2)]],
+    constant uint& dim [[buffer(3)]],
+    uint tpig [[thread_position_in_grid]]
+) {
+    if (tpig >= dim) return;
+    out[tpig] = w[token * dim + tpig];
+}
+
 // ── RMS Norm ──────────────────────────────────────────────────────────────────
 
 /**
@@ -797,8 +810,17 @@ kernel void argmax(
     threadgroup float local_max[32]; 
     threadgroup uint local_idx[32];
     
-    float val = (tpig < n) ? logits[tpig] : -INFINITY;
-    uint idx = tpig;
+    float val = -INFINITY;
+    uint idx = 0;
+    
+    // Each thread loops over its portion of the vocab
+    for (uint i = tpig; i < n; i += 1024) {
+        float v = logits[i];
+        if (v > val) {
+            val = v;
+            idx = i;
+        }
+    }
     
     // SIMD-level reduction
     for (uint offset = 16; offset > 0; offset /= 2) {

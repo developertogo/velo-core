@@ -100,6 +100,8 @@ mod tests {
             device: None,
             command_queue: None,
             library: None,
+            tp_degree: 1,
+            tp_rank: 0,
         };
         let pool = ModelPool::new(handles);
         assert!(pool.get("test").is_none());
@@ -113,6 +115,8 @@ mod tests {
             device: None,
             command_queue: None,
             library: None,
+            tp_degree: 1,
+            tp_rank: 0,
         };
         let pool = ModelPool::new(handles);
         let rx = pool.prefetch("test".into(), PathBuf::from("fake.gguf"));

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions};
+use objc2_metal::{MTLBuffer, MTLCommandQueue, MTLCopyAllDevices, MTLDevice, MTLLibrary, MTLResourceOptions};
 
 use crate::paged_attention::{BlockMapping, PageManagerError, PageSpan, PagedAttentionBlockManager, PagedAttentionConfig};
 use crate::radix_cache::{CacheLookup, KvCacheHandle};
@@ -60,7 +60,7 @@ fn load_metal_library(
 }
 
 
-/// Opaque handles to Metal framework objects.
+/// Opaque handles to Metal framework objects for a single device or shard.
 pub struct MetalRuntimeHandles {
     /// The Metal device (GPU).
     pub device: Option<Retained<ProtocolObject<dyn MTLDevice>>>,
@@ -68,6 +68,10 @@ pub struct MetalRuntimeHandles {
     pub command_queue: Option<Retained<ProtocolObject<dyn MTLCommandQueue>>>,
     /// Compiled shader library.
     pub library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
+    /// Tensor Parallelism degree.
+    pub tp_degree: usize,
+    /// Rank of this shard (0 to tp_degree - 1).
+    pub tp_rank: usize,
 }
 
 unsafe impl Send for MetalRuntimeHandles {}
@@ -79,6 +83,8 @@ impl Clone for MetalRuntimeHandles {
             device: self.device.clone(),
             command_queue: self.command_queue.clone(),
             library: self.library.clone(),
+            tp_degree: self.tp_degree,
+            tp_rank: self.tp_rank,
         }
     }
 }
@@ -154,8 +160,20 @@ impl MetalMemoryRuntime {
             ));
         }
 
-        let device = MTLCreateSystemDefaultDevice()
-            .ok_or_else(|| SpeculativeError::Model("No Metal device found".to_string()))?;
+        let tp_degree = config.tensor_parallel_degree;
+        let all_devices = MTLCopyAllDevices();
+        
+        if all_devices.count() < tp_degree {
+            return Err(SpeculativeError::Model(format!(
+                "Requested TP degree {} but only {} Metal devices found",
+                tp_degree,
+                all_devices.count()
+            )));
+        }
+
+        // For V1 of TP, we just pick the primary device for the context.
+        // The LlamaTensorParallelModel will manage the other shards.
+        let device = all_devices.objectAtIndex(0).clone();
 
         let command_queue = device.newCommandQueue().ok_or_else(|| {
             SpeculativeError::Model("Failed to create Metal command queue".to_string())
@@ -180,6 +198,8 @@ impl MetalMemoryRuntime {
                 device: Some(device.clone()),
                 command_queue: Some(command_queue),
                 library: Some(library),
+                tp_degree,
+                tp_rank: 0,
             },
         };
         let store = SharedMetalKvStore(Arc::new(Mutex::new(crate::metal::kv_store::MetalKvStore::new(
@@ -333,6 +353,8 @@ mod tests {
             device: None,
             command_queue: None,
             library: None,
+            tp_degree: 1,
+            tp_rank: 0,
         };
         let handles2 = handles.clone();
         assert!(handles2.device.is_none());

@@ -67,8 +67,7 @@ impl MetalKvStore {
 
     /// Returns the total number of bytes currently allocated in the pools.
     pub fn allocated_bytes(&self) -> usize {
-        if self.free_offsets.is_empty() && self.blocks.is_empty() { return 0; }
-        self.blocks.len() * (self.k_pool.length() as usize / (self.free_offsets.len() + self.blocks.len())) * 2
+        self.blocks.values().map(|b| b.bytes).sum()
     }
 
     /// Allocates a new block from the pool for a given sequence length.

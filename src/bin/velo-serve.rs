@@ -130,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         model_name: "velo-llama".into(),
         memory: memory_config,
         quantization: meta.quantization,
+        tensor_parallel_degree: 1,
     };
 
     let mut backend_config = MetalBackendConfig::default();
@@ -137,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
     backend_config.kv_bytes_per_token = 4;
     backend_config.paged_block_size = 16;
     backend_config.quantization = meta.quantization;
+    backend_config.tensor_parallel_degree = 1;
 
     let mut backend = MetalBackend::new(backend_config)?;
     let engine_config = EngineConfig {

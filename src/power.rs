@@ -117,3 +117,55 @@ impl PrecisionGovernor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paged_attention::KvCacheType;
+    use crate::amx::AmxPrecision;
+
+    #[test]
+    fn test_smc_telemetry() {
+        let smc = SmcTelemetry::new(50000); // 50W budget
+        assert_eq!(smc.power_budget_mw(), 50000);
+        
+        smc.set_simulated_draw(25000);
+        assert_eq!(smc.current_power_mw(), 25000);
+    }
+
+    #[test]
+    fn test_governor_states() {
+        let smc = SmcTelemetry::new(10000);
+        let gov = PrecisionGovernor::new(Box::new(smc));
+        
+        // Performance (0%)
+        assert_eq!(gov.evaluate_state(), PowerState::Performance);
+        assert_eq!(gov.adapt_kv_precision(KvCacheType::Fp32), KvCacheType::Fp32);
+        assert_eq!(gov.adapt_amx_precision(), AmxPrecision::Fp32);
+        assert_eq!(gov.batch_size_multiplier(), 1.0);
+
+        // Balanced (75%)
+        let smc_ref = SmcTelemetry::new(10000);
+        smc_ref.set_simulated_draw(7500);
+        let gov = PrecisionGovernor::new(Box::new(smc_ref));
+        assert_eq!(gov.evaluate_state(), PowerState::Balanced);
+        assert_eq!(gov.adapt_kv_precision(KvCacheType::Fp32), KvCacheType::Fp8);
+        assert_eq!(gov.adapt_amx_precision(), AmxPrecision::Bf16);
+        assert_eq!(gov.batch_size_multiplier(), 1.0); // 0.75 is <= 0.8
+
+        // Efficiency (95%)
+        let smc_ref = SmcTelemetry::new(10000);
+        smc_ref.set_simulated_draw(9500);
+        let gov = PrecisionGovernor::new(Box::new(smc_ref));
+        assert_eq!(gov.evaluate_state(), PowerState::Efficiency);
+        assert_eq!(gov.adapt_kv_precision(KvCacheType::Fp32), KvCacheType::Int8);
+        assert_eq!(gov.adapt_amx_precision(), AmxPrecision::Fp16);
+        assert_eq!(gov.batch_size_multiplier(), 0.5); // 0.95 > 0.8
+
+        // Throttled (110%)
+        let smc_ref = SmcTelemetry::new(10000);
+        smc_ref.set_simulated_draw(11000);
+        let gov = PrecisionGovernor::new(Box::new(smc_ref));
+        assert_eq!(gov.batch_size_multiplier(), 0.1);
+    }
+}

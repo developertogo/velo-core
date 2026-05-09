@@ -38,6 +38,7 @@ pub extern "C" fn velo_core_engine_new(
         model_name,
         memory: config.memory,
         quantization: Quantization::Q4_0, // Default to Q4_0 for efficiency
+        tensor_parallel_degree: 1,
     };
 
     match MetalMemoryRuntime::new(runtime_config) {
@@ -90,5 +91,52 @@ pub extern "C" fn velo_core_free_tokens(tokens_ptr: *mut u32, len: usize) {
         unsafe {
             let _ = Vec::from_raw_parts(tokens_ptr, len, len);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn test_ffi_lifecycle() {
+        let model_name = CString::new("test-model").unwrap();
+        let handle = velo_core_engine_new(model_name.as_ptr(), 4, 1024);
+        
+        if handle.is_null() {
+            // Expected in non-Metal CI environments
+            return;
+        }
+
+        let prompt = vec![1u32, 2, 3];
+        let mut out_len = 0;
+        let tokens_ptr = velo_core_engine_generate(
+            handle,
+            prompt.as_ptr(),
+            prompt.len(),
+            10,
+            &mut out_len
+        );
+
+        assert!(!tokens_ptr.is_null());
+        assert_eq!(out_len, 3);
+        
+        let result = unsafe { std::slice::from_raw_parts(tokens_ptr, out_len) };
+        assert_eq!(result, &[1, 2, 3]);
+
+        velo_core_free_tokens(tokens_ptr, out_len);
+        velo_core_engine_free(handle);
+    }
+
+    #[test]
+    fn test_ffi_null_handling() {
+        assert!(velo_core_engine_new(ptr::null(), 1, 1).is_null());
+        
+        let mut out_len = 0;
+        assert!(velo_core_engine_generate(ptr::null_mut(), ptr::null(), 0, 0, &mut out_len).is_null());
+        
+        velo_core_engine_free(ptr::null_mut());
+        velo_core_free_tokens(ptr::null_mut(), 0);
     }
 }
