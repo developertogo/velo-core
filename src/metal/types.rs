@@ -1,17 +1,31 @@
+//! Metal Backend Types
+//!
+//! This module defines the core data types for the Apple Metal GPU backend.
+//!
+//! ### Key Concepts for Beginners:
+//! - **Quantization**: Think of this as "Image Compression" for numbers. A normal number 
+//!   (F32) takes 32 bits. A "Quantized" number (Q4_0) takes only 4 bits. This allows us 
+//!   to fit massive 70-billion-parameter models into a small laptop's memory.
+//! - **Unified Memory**: On most computers, the CPU (brain) and GPU (graphics) have 
+//!   different memory pools. On Apple Silicon, they share the **same** pool. This is 
+//!   why Macs are so good at AI—the data doesn't have to travel over a slow wire between 
+//!   the two chips.
+
 use crate::gguf::GgmlType;
 
+/// The numerical format used to store model weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Quantization {
-    /// 4-bit quantization (block-based).
+    /// 4-bit quantization (8x smaller than normal). Good for basic use.
     #[default]
     Q4_0,
-    /// 4-bit K-quantization (Super-block).
+    /// High-quality 4-bit quantization. The "Gold Standard" for home AI.
     Q4K,
-    /// 32-bit floating point.
+    /// High precision (no compression). Very slow and memory-heavy.
     F32,
-    /// 16-bit floating point.
+    /// Standard precision for modern GPUs.
     F16,
-    /// 8-bit quantization.
+    /// 8-bit quantization. A good middle ground.
     Q8K,
 }
 

@@ -1,8 +1,31 @@
 #include <metal_stdlib>
 using namespace metal;
 
+/**
+ * VELO GPU KERNELS: The Engine Room
+ *
+ * This file contains the low-level code that runs on the Apple GPU.
+ *
+ * ### How it Works:
+ * 1. **Massive Parallelism**: Unlike a CPU which has ~10 cores, an Apple GPU has thousands.
+ * 2. **Kernels**: These are functions (marked with the `kernel` keyword) that run on every
+ *    GPU core at the same time.
+ * 3. **Buffers**: Data is passed to the GPU in "Buffers". We number them using `[[buffer(N)]]`.
+ * 4. **Threads**: A "Thread" is a single worker. We use `[[thread_position_in_grid]]` to 
+ *    tell each worker which part of the data they are responsible for.
+ *
+ * Think of the GPU as a massive factory with thousands of workers. This file is the
+ * instruction manual for those workers.
+ */
+
 // ── Embedding Lookup ──────────────────────────────────────────────────────────
 
+/**
+ * Look up a word (token) in the model's dictionary.
+ * 
+ * Imagine a giant dictionary (the weights `w`). This kernel tells thousands of workers
+ * to go to the page for a specific `token` and copy one number each to the `out` buffer.
+ */
 kernel void embed_lookup(
     device float* out [[buffer(0)]],
     device const float* w [[buffer(1)]],
@@ -29,6 +52,22 @@ kernel void embed_lookup(
  * @param dim    Dimensionality of the input/output vectors
  * @param tpig   Thread position in grid (only thread 0 executes)
  */
+// ── RMS Norm ──────────────────────────────────────────────────────────────────
+
+/**
+ * Root Mean Square Layer Normalization (RMSNorm).
+ * 
+ * **Concept:** Think of this as "Volume Normalization" for a song. We don't want the 
+ * model's signals to get too loud (large numbers) or too quiet. This kernel 
+ * squeezes the numbers so they all stay within a healthy range.
+ * 
+ * @param x_out  Output buffer [dim]
+ * @param x_in   Input buffer [dim]
+ * @param w      Weight buffer for scaling [dim]
+ * @param eps    Small epsilon value to prevent division by zero
+ * @param dim    Dimensionality of the input/output vectors
+ * @param tpig   Thread position in grid (only thread 0 executes)
+ */
 kernel void rms_norm(
     device float* x_out [[buffer(0)]],
     device const float* x_in [[buffer(1)]],
@@ -39,11 +78,14 @@ kernel void rms_norm(
 ) {
     if (tpig >= 1) return; // Only one thread for now to simplify, handles whole row
 
+    // 1. Calculate the 'volume' (sum of squares)
     float ss = 0.0f;
     for (uint i = 0; i < dim; i++) {
         ss += x_in[i] * x_in[i];
     }
+    // 2. Calculate the scaling factor
     float scale = 1.0f / sqrt(ss / (float)dim + eps);
+    // 3. Apply the scale to every number
     for (uint i = 0; i < dim; i++) {
         x_out[i] = x_in[i] * scale * w[i];
     }
@@ -54,15 +96,9 @@ kernel void rms_norm(
 /**
  * Rotary Position Embedding (RoPE).
  * 
- * Injects positional information into query and key vectors by rotating pairs 
- * of coordinates based on their position in the sequence.
- * 
- * @param q          Query buffer to rotate in-place
- * @param k          Key buffer to rotate in-place
- * @param pos        Current sequence position
- * @param head_dim   Dimensionality of each attention head
- * @param freq_base  Base frequency for the rotation angles (e.g., 10000.0)
- * @param tpig       Thread position in grid (handles pairs of dimensions)
+ * **Concept:** LLMs don't naturally know the order of words. RoPE "rotates" the 
+ * numbers in a way that represents their position. It's like adding a 
+ * "time-stamp" to every word so the model knows which word came first.
  */
 kernel void rope(
     device float* q [[buffer(0)]],
@@ -88,7 +124,7 @@ kernel void rope(
     q[i]   = q0 * cos_mt - q1 * sin_mt;
     q[i+1] = q0 * sin_mt + q1 * cos_mt;
 
-    // K rotation (assuming same logic)
+    // K rotation
     float k0 = k[i];
     float k1 = k[i+1];
     k[i]   = k0 * cos_mt - k1 * sin_mt;
@@ -100,14 +136,13 @@ kernel void rope(
 /**
  * Standard Matrix-Vector Multiplication (FP32).
  * 
- * Computes `out = W * x` where W is a matrix and x is a vector.
+ * **Concept:** This is the most important operation in AI. It's where the "thinking" 
+ * happens. Every worker takes one row of the "Brain" (the matrix `w`) and 
+ * multiplies it by the current "Thought" (the vector `x`).
  * 
  * @param out   Output vector buffer [rows]
  * @param w     Weight matrix buffer [rows, cols] (row-major)
  * @param x     Input vector buffer [cols]
- * @param rows  Number of rows in W (output size)
- * @param cols  Number of columns in W (input size)
- * @param tpig  Thread position in grid (maps to the row index)
  */
 kernel void matvec_f32(
     device float* out [[buffer(0)]],
@@ -117,7 +152,7 @@ kernel void matvec_f32(
     constant uint& cols [[buffer(4)]],
     uint tpig [[thread_position_in_grid]]
 ) {
-    if (tpig >= rows) return;
+    if (tpig >= rows) return; // Each worker handles one row
 
     float sum = 0.0f;
     for (uint c = 0; c < cols; c++) {

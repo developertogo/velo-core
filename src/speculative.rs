@@ -1,18 +1,34 @@
+//! Speculative Decoding: The "Draft and Verify" Strategy
+//!
+//! Normally, LLMs generate text one token at a time. The large, accurate models
+//! are slow because they have billions of parameters to calculate for every word.
+//!
+//! **The Trick:** Speculative Decoding.
+//! 1. **Drafting**: A tiny, lightning-fast model (the "Assistant") takes a quick 
+//!    guess at the next 5-10 tokens.
+//! 2. **Verifying**: The large, accurate model (the "Editor") looks at all those 
+//!    guesses in a single pass. 
+//! 3. **Accepting**: If the Editor agrees with the first 3 guesses but not the 4th, 
+//!    we keep the 3 correct ones and throw away the rest.
+//!
+//! This is much faster because the "Editor" can verify 10 words almost as fast as 
+//! it can generate 1 word.
+
 use crate::radix_cache::{CacheLookup, TokenId};
 
-/// A predicted token and its associated probability/confidence.
+/// A guess made by the Draft Model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NextTokenPrediction {
-    /// The vocabulary ID of the predicted token.
+    /// The ID of the word the assistant guessed.
     pub token: TokenId,
-    /// The logit or probability score.
+    /// How confident the assistant is (0.0 to 1.0).
     pub confidence: f32,
 }
 
-/// Verification outcome for a single drafted token.
+/// The "Ground Truth" provided by the Target Model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifyStep {
-    /// The token actually produced by the target model.
+    /// The token the accurate model *actually* wanted to see.
     pub expected: TokenId,
 }
 
@@ -24,8 +40,13 @@ pub struct TreeVerifyResult {
 }
 
 /// A tree of drafted tokens for parallel verification.
+/// 
+/// **Advanced Concept:** Instead of just guessing one line of text, we can guess 
+/// multiple possible branches (e.g., if the next word could be "Apple" OR "Banana"). 
+/// The GPU can check all these branches at the same time!
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeculativeTree {
+    /// The nodes in our "alternate future" tree.
     pub nodes: Vec<TreeNode>,
 }
 
@@ -34,7 +55,7 @@ pub struct SpeculativeTree {
 pub struct TreeNode {
     /// The drafted token ID.
     pub token: TokenId,
-    /// Index of the parent node in the `SpeculativeTree::nodes` array.
+    /// Index of the parent node (to reconstruct the sentence).
     pub parent: Option<usize>,
 }
 
@@ -72,6 +93,7 @@ impl SpeculativeTree {
         path
     }
 
+    /// Finds the longest branch in the tree that the Editor (Target Model) agreed with.
     pub fn find_best_path(&self, verified: &TreeVerifyResult) -> (Vec<TokenId>, Option<TokenId>) {
         let mut best_path = Vec::new();
         let mut rejected_token = None;
@@ -107,22 +129,24 @@ impl SpeculativeTree {
     }
 }
 
-/// Interface for the smaller, faster model used to generate speculative token paths.
+/// The job description for an "Assistant" (Draft Model).
 pub trait DraftModel {
     /// Connects the draft model to an existing prefix cache to reuse KV memory.
     fn bind_prefix_cache(&mut self, _prefix: &CacheLookup) -> Result<()> {
         Ok(())
     }
 
-    /// Associates the draft model with a specific execution slot.
+    /// Associates the draft model with a specific execution slot (workspace).
     fn bind_slot(&mut self, _slot: crate::slot_manager::SlotId) -> Result<()> {
         Ok(())
     }
 
+    /// Switches the underlying model (for multi-model serving).
     fn switch_model(&mut self, _name: &str, _pool: &crate::model_pool::ModelPool) -> Result<()> {
         Ok(())
     }
 
+    /// Asks the assistant to make some guesses.
     fn draft(
         &mut self,
         context: &[TokenId],
@@ -130,6 +154,7 @@ pub trait DraftModel {
         matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
     ) -> Result<Vec<NextTokenPrediction>>;
 
+    /// Asks the assistant to build a "Tree" of multiple alternate guesses.
     fn draft_tree(
         &mut self,
         context: &[TokenId],
@@ -137,7 +162,7 @@ pub trait DraftModel {
         _width: usize,
         _matcher: Option<&mut (dyn crate::constraints::CfgMatcher + '_)>,
     ) -> Result<SpeculativeTree> {
-        // Default implementation: just a linear chain
+        // Default implementation: just a linear chain (one guess after another).
         let linear = self.draft(context, _max_tokens, _matcher)?;
         if linear.is_empty() {
             return Err(SpeculativeError::Model("Draft model returned no tokens".into()));
@@ -150,6 +175,7 @@ pub trait DraftModel {
         Ok(tree)
     }
 
+    /// Helper to process multiple requests in one GPU pass.
     fn draft_batch(
         &mut self,
         requests: &mut [(&[TokenId], usize, Option<&mut (dyn crate::constraints::CfgMatcher + '_)>)],
