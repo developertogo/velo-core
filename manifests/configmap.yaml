@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: core-config
+  namespace: default
+data:
+  CORE_PORT: "8080"
+  LOG_LEVEL: "DEBUG"
+  WORKER_THREADS: "4"
