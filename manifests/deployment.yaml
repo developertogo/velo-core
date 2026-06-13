@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-engine
+  namespace: default
+  labels:
+    app: core-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: core-engine
+  template:
+    metadata:
+      labels:
+        app: core-engine
+    spec:
+      containers:
+      - name: core
+        image: velo-core:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - configMapRef:
+            name: core-config
+        resources:
+          limits:
+            cpu: "2"
+            memory: 1Gi
+          requests:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
