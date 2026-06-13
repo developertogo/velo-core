@@ -1,3 +1,16 @@
+//! VeloScheduler: The Traffic Controller
+//!
+//! While `VeloEngine` handles the math and memory, the `VeloScheduler` handles the "crowd".
+//! It manages a queue of people waiting to talk to the AI and decides when to let them in.
+//!
+//! ### Key Concepts for Beginners:
+//! - **Continuous Batching**: Imagine a bus (the GPU) that never stops. As soon as one 
+//!   passenger gets off (a request finishes), another passenger gets on (a new request starts),
+//!   even if the other passengers are still in the middle of their journey.
+//! - **Worker Loop**: A background thread that constantly runs the engine's "step" function.
+//! - **Async Interface**: Allowing the rest of the application to "submit and wait" for tokens
+//!   without blocking the whole system.
+
 use std::collections::VecDeque;
 use tokio::sync::{mpsc, oneshot};
 use crate::radix_cache::TokenId;
@@ -10,47 +23,57 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use crate::metal::runtime::MetalRuntimeHandles;
 
-/// A request sent to the scheduler.
+/// A single request sent to the scheduler by a user.
 pub struct SchedulerRequest {
+    /// The prompt tokens.
     pub prompt: Vec<TokenId>,
+    /// How many tokens to generate.
     pub max_new_tokens: usize,
+    /// A "pipe" (channel) to send generated tokens back to the user as they happen.
     pub token_tx: mpsc::UnboundedSender<Result<TokenId, EngineError>>,
+    /// A notification channel to tell the user when we are completely done.
     pub done_tx: oneshot::Sender<Result<(), EngineError>>,
-    /// Optional model name for this request (if pool-based).
+    /// Optional model name if we are using a pool of different models.
     pub model: Option<String>,
 }
 
-/// Commands for administrative tasks in the scheduler.
+/// Commands for administrative tasks (like loading new models).
 pub enum SchedulerCommand {
-    /// Load a model from disk into the pool in the background.
+    /// Load a model from disk into the pool.
     Prefetch { name: String, path: std::path::PathBuf },
-    /// Set the default models used for new requests.
+    /// Change which models are currently being used for inference.
     SwitchModels { target: String, draft: Option<String> },
 }
 
 /// A high-level asynchronous scheduler for the Velo Engine.
 ///
-/// It handles request admission, continuous batching, and provides
-/// an async interface for submitting requests.
+/// This is the main entry point for most applications. It runs a background
+/// task that manages the engine and processes requests.
 pub struct VeloScheduler {
+    /// Channel for sending new requests to the background worker.
     request_tx: mpsc::UnboundedSender<SchedulerRequest>,
+    /// Channel for sending commands (like switching models).
     command_tx: mpsc::UnboundedSender<SchedulerCommand>,
+    /// Real-time statistics about throughput and latency.
     metrics: Arc<SchedulerMetrics>,
 }
 
-/// Real-time metrics for the Velo Scheduler.
+/// Real-time metrics for monitoring the scheduler's health.
 #[derive(Default)]
 pub struct SchedulerMetrics {
     pub total_tokens_generated: AtomicU64,
     pub total_requests_completed: AtomicU64,
+    /// How many GPU slots are currently being used.
     pub active_slots: AtomicUsize,
+    /// Total "Time To First Token" in milliseconds.
     pub total_ttft_ms: AtomicU64,
     pub requests_with_ttft: AtomicU64,
     pub scheduler_start_time: Option<Instant>,
 }
 
 impl VeloScheduler {
-    /// Starts a new scheduler worker in the background.
+    /// Starts the scheduler worker loop in a background thread.
+    /// This is where the actual "work" happens.
     pub fn start<R, D, T>(
         mut engine: VeloEngine<R>,
         mut draft_model: D,
@@ -69,11 +92,12 @@ impl VeloScheduler {
         });
         let worker_metrics = metrics.clone();
 
+        // Spawn the background worker thread.
         tokio::spawn(async move {
             let mut active: Vec<ActiveRequestInternal> = Vec::new();
             let mut pending = VecDeque::new();
             
-            // Initialize model pool with hardware handles from the engine
+            // The ModelPool allows us to keep multiple models ready to go on the GPU.
             let pool = crate::model_pool::ModelPool::new(
                 engine.runtime().metal_handles().unwrap_or(MetalRuntimeHandles {
                     device: None, command_queue: None, library: None, tp_degree: 1, tp_rank: 0
@@ -81,33 +105,27 @@ impl VeloScheduler {
             );
 
             loop {
-                // 1. Process commands
+                // 1. Check for administrative commands (like loading a new model).
                 while let Ok(cmd) = command_rx.try_recv() {
                     match cmd {
                         SchedulerCommand::Prefetch { name, path } => {
-                            println!("Prefetching model {} from {:?}", name, path);
                             pool.prefetch(name, path);
                         }
                         SchedulerCommand::SwitchModels { target, draft } => {
-                            println!("Switching models: target={}, draft={:?}", target, draft);
-                            if let Err(e) = target_model.switch_model(&target, &pool) {
-                                eprintln!("Failed to switch target model: {:?}", e);
-                            }
+                            let _ = target_model.switch_model(&target, &pool);
                             if let Some(draft_name) = draft {
-                                if let Err(e) = draft_model.switch_model(&draft_name, &pool) {
-                                    eprintln!("Failed to switch draft model: {:?}", e);
-                                }
+                                let _ = draft_model.switch_model(&draft_name, &pool);
                             }
                         }
                     }
                 }
 
-                // 2. Collect new requests
+                // 2. Look for brand new requests from users.
                 while let Ok(req) = request_rx.try_recv() {
                     pending.push_back(req);
                 }
 
-                // 2. Admit pending requests into free slots
+                // 3. ADMISSION: If we have free slots on the GPU, let waiting passengers (requests) on.
                 while active.len() < engine.slot_pool_capacity() && !pending.is_empty() {
                     if let Some(req) = pending.pop_front() {
                         match Self::admit_request(&mut engine, &mut draft_model, &mut target_model, req) {
@@ -122,24 +140,24 @@ impl VeloScheduler {
                     }
                 }
 
+                // If nothing is happening, wait for a new request.
                 if active.is_empty() && pending.is_empty() {
-                    // Wait for new requests if nothing is active
                     if let Some(req) = request_rx.recv().await {
                         pending.push_back(req);
                         continue;
                     } else {
-                        break; // Channel closed
+                        break; // All channels closed, stop the scheduler.
                     }
                 }
 
-                // 3. Run one step of speculative decoding for all active requests
+                // 4. STEP: Run one round of token generation for everyone currently "on the bus".
                 if !active.is_empty() {
                     if let Err(e) = Self::step(&mut engine, &mut draft_model, &mut target_model, &mut active, &worker_metrics).await {
                         eprintln!("Scheduler step failed: {:?}", e);
                     }
                 }
 
-                // 4. Remove finished/cancelled requests
+                // 5. CLEANUP: Remove requests that have finished their job or were cancelled.
                 let mut i = 0;
                 while i < active.len() {
                     let is_done = active[i].generated_count >= active[i].max_new_tokens || active[i].finished;
@@ -158,7 +176,7 @@ impl VeloScheduler {
                     }
                 }
 
-                // Yield to allow other tasks to run
+                // Allow other parts of the program to run briefly.
                 tokio::task::yield_now().await;
             }
         });
@@ -342,6 +360,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_basic_flow() {
+        // TEST: Asynchronous "Ask and Receive"
+        // In a real app, the user shouldn't have to wait for the whole paragraph
+        // to be done. They want to see tokens appearing one by one.
+        
         let script = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let backend = MockBackend::new(script);
        
@@ -360,12 +382,14 @@ mod tests {
         let draft_model = GreedyDraftModel::new(backend.clone());
         let target_model = GreedyTargetModel::new(backend);
        
+        // 1. Start the background worker loop.
         let scheduler = VeloScheduler::start(engine, draft_model, target_model);
        
         let prompt = vec![1, 2, 3];
+        // 2. Submit a request. We get back a "pipe" (rx) for tokens.
         let (mut token_rx, done_rx) = scheduler.submit(prompt, 5);
        
-        // Wait for some tokens
+        // 3. Collect tokens as they arrive from the background thread.
         let mut tokens = Vec::new();
         while tokens.len() < 5 {
             if let Some(Ok(token)) = token_rx.recv().await {
@@ -376,11 +400,16 @@ mod tests {
         }
        
         assert_eq!(tokens.len(), 5);
+        // 4. Ensure the whole process finished successfully.
         let _ = done_rx.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn test_scheduler_concurrency() {
+        // TEST: Multiple Users at Once
+        // We simulate two people asking the AI different things simultaneously.
+        // The scheduler must manage both "passengers" on the GPU bus.
+        
         let script = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let backend = MockBackend::new(script);
        
@@ -401,9 +430,11 @@ mod tests {
        
         let scheduler = VeloScheduler::start(engine, draft_model, target_model);
        
+        // Submit two requests at the same time.
         let (mut rx1, done1) = scheduler.submit(vec![1, 1], 2);
         let (mut rx2, done2) = scheduler.submit(vec![2, 2], 2);
        
+        // We use 'tokio::spawn' to simulate two independent users waiting for their answers.
         let h1 = tokio::spawn(async move {
             let mut count = 0;
             while let Some(Ok(_)) = rx1.recv().await { count += 1; if count == 2 { break; } }
@@ -422,6 +453,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_cancellation() {
+        // TEST: Cleaning up after a "Hang up"
+        // If a user closes their tab (cancellation), we should immediately stop
+        // using the GPU and free up their memory slot.
+        
         let script = vec![1, 2, 3, 4, 5];
         let backend = MockBackend::new(script);
         let engine_config = crate::engine::EngineConfig {
@@ -438,10 +473,14 @@ mod tests {
         let scheduler = VeloScheduler::start(engine, GreedyDraftModel::new(backend.clone()), GreedyTargetModel::new(backend));
 
         let (rx, _done) = scheduler.submit(vec![1], 10);
-        drop(rx); // Immediate cancellation
+        
+        // Simulating the user "hanging up" by dropping the receiver.
+        drop(rx); 
 
-        // Wait a bit for scheduler to process
+        // Give the background loop a few milliseconds to notice.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        
+        // The slot should be empty now!
         assert_eq!(scheduler.metrics().active_slots.load(Ordering::Relaxed), 0);
     }
 }
